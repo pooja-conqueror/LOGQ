@@ -54,3 +54,44 @@ func (p *Pipeline) Process(rec *eval.Record) (out *eval.Record, keep bool, done 
 	}
 	return cur, true, done
 }
+
+// Flusher is implemented by stages that buffer records internally and can
+// only emit them once the input stream is exhausted — sort (commit 25) is
+// the first such stage; a future stats (Phase 8) will be another. Most
+// stages (fields, limit) stream per-record and don't need this at all.
+type Flusher interface {
+	Flush(emit func(*eval.Record))
+}
+
+// Flush signals end-of-stream: every buffering stage emits its held
+// records, in stage order, and each flushed record is then run through
+// the REMAINING stages of the pipeline — exactly as if it had arrived
+// normally at that point in the chain. This is what makes `sort ... limit
+// 10 | fields x` correctly project the 10 sorted records through fields
+// before they reach emit, instead of bypassing later stages entirely.
+func (p *Pipeline) Flush(emit func(*eval.Record)) {
+	for i, stage := range p.stages {
+		flusher, ok := stage.(Flusher)
+		if !ok {
+			continue
+		}
+		flusher.Flush(func(rec *eval.Record) {
+			p.processFrom(i+1, rec, emit)
+		})
+	}
+}
+
+// processFrom runs rec through stages[from:] only, calling emit if it
+// survives all of them. done is irrelevant here — by the time Flush runs,
+// there's no more input left to stop reading anyway.
+func (p *Pipeline) processFrom(from int, rec *eval.Record, emit func(*eval.Record)) {
+	cur := rec
+	for _, stage := range p.stages[from:] {
+		out, keep, _ := stage.Process(cur)
+		if !keep {
+			return
+		}
+		cur = out
+	}
+	emit(cur)
+}
