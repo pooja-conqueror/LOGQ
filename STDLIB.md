@@ -8,7 +8,7 @@ evidence trail for the rationale below.
 
 | Would-be dependency | logq uses instead | Rationale |
 |---|---|---|
-| _(entries land starting Phase 1 — first real substitution is `stretchr/testify` at the lexer's test suite)_ | | |
+| `stretchr/testify` | `testing` + table-driven tests + `t.Run` subtests | Go ships a full test framework; a third-party assertion library buys nothing but an import, and zero test dependencies means nothing to disclose under the rules' dev-dependency carve-out either. |
 
 ## Disclosures
 
