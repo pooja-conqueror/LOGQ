@@ -13,6 +13,7 @@ import (
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 	"github.com/pooja-conqueror/LOGQ/internal/formats"
 	"github.com/pooja-conqueror/LOGQ/internal/logfmtx"
+	"github.com/pooja-conqueror/LOGQ/internal/pipeline"
 	"github.com/pooja-conqueror/LOGQ/internal/query"
 	"github.com/pooja-conqueror/LOGQ/internal/render"
 )
@@ -159,20 +160,19 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
-	if len(q.Stages) > 0 {
-		// The grammar and stage implementations (fields/sort/limit) exist
-		// and are independently tested (Phase 7 so far), but nothing here
-		// yet actually runs them against real records — that's the very
-		// next commit. Silently ignoring a stage the user explicitly
-		// asked for would be worse than refusing to run at all.
-		fmt.Fprintln(stderr, "logq: pipeline stages are parsed but not yet wired into execution")
-		return exitCompile
-	}
 	cf, err := eval.Compile(q.Filter)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
+	pl, err := buildPipeline(q.Stages)
+	if err != nil {
+		// e.g. NewFields' S-8 duplicate-output-column check — still a
+		// compile-time failure, before any I/O.
+		fmt.Fprintf(stderr, "logq: %v\n", err)
+		return exitCompile
+	}
+	stagesPresent := len(q.Stages) > 0
 
 	sources, closeAll, err := openSources(files, stdin)
 	if err != nil {
@@ -195,9 +195,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		buffered = render.NewCSV()
 	}
 
+	// pl is ONE shared pipeline instance across every source, not rebuilt
+	// per file — this is what makes `limit N` (or a bounded `sort ...
+	// limit N`) count correctly across multiple files, not per-file, and
+	// what lets a satisfied limit stop reading LATER files entirely, not
+	// just the rest of the current one.
 	var totalLines, malformed, droppedByWindow int
 	for _, src := range sources {
-		n, m, d, srcErr := processSource(out, buffered, cf, now, src, *format, *output, loc, sinceBound, untilBound)
+		n, m, d, done, srcErr := processSource(out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound)
 		totalLines += n
 		malformed += m
 		droppedByWindow += d
@@ -205,6 +210,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "logq: %v\n", srcErr)
 			return exitIO
 		}
+		if done {
+			break // e.g. limit's count reached — no reason to open later files at all
+		}
+	}
+
+	// Flush any buffering stage (sort) — its held records still need to
+	// go through the same rendering path a normally-streamed record
+	// would, always, regardless of whether the loop above stopped early.
+	var flushErr error
+	pl.Flush(func(rec *eval.Record) {
+		if flushErr != nil {
+			return
+		}
+		flushErr = renderRecord(out, buffered, rec, nil, *output, stagesPresent)
+	})
+	if flushErr != nil {
+		fmt.Fprintf(stderr, "logq: write error: %v\n", flushErr)
+		return exitIO
 	}
 
 	if buffered != nil {
@@ -253,6 +276,59 @@ type bufferedRenderer interface {
 	Flush(w io.Writer) error
 }
 
+// buildPipeline converts the parsed Stage AST into executable
+// pipeline.Stage values, once, before any I/O — a stage that fails to
+// build (currently only NewFields' S-8 duplicate-column check) is a
+// compile-time error, exactly like an invalid query itself.
+func buildPipeline(stages []query.Stage) (*pipeline.Pipeline, error) {
+	execStages := make([]pipeline.Stage, 0, len(stages))
+	for _, st := range stages {
+		switch s := st.(type) {
+		case *query.FieldsStage:
+			fs, err := pipeline.NewFields(s)
+			if err != nil {
+				return nil, err
+			}
+			execStages = append(execStages, fs)
+		case *query.SortStage:
+			execStages = append(execStages, pipeline.NewSort(s))
+		case *query.LimitStage:
+			execStages = append(execStages, pipeline.NewLimit(s.Limit))
+		default:
+			return nil, fmt.Errorf("internal error: unrecognized stage type %T", st)
+		}
+	}
+	return pipeline.New(execStages...), nil
+}
+
+// renderRecord writes rec per the requested output mode.
+//
+// When pipeline stages are present, raw's byte-verbatim losslessness
+// guarantee (§11.6) no longer applies — fields can transform a record's
+// content entirely, and sort can hold and reorder it far from its
+// original position in the stream — so raw falls back to jsonl
+// serialization of the final record uniformly whenever ANY stage ran,
+// rather than trying to selectively preserve original bytes only for the
+// stage combinations that happen not to touch content. line is the
+// original source bytes and may be nil (always is, for a record reaching
+// this via Pipeline.Flush) — safe exactly because stagesPresent is always
+// true whenever a flushed record exists at all (only a stage, sort, ever
+// buffers), so the nil is never actually dereferenced.
+func renderRecord(out io.Writer, buffered bufferedRenderer, rec *eval.Record, line []byte, output string, stagesPresent bool) error {
+	switch output {
+	case "jsonl":
+		return render.JSONL(out, rec)
+	case "table", "csv":
+		buffered.Add(rec)
+		return nil
+	default: // "raw"
+		if stagesPresent {
+			return render.JSONL(out, rec)
+		}
+		return render.Raw(out, line)
+	}
+}
+
 // processSource fully processes one source: transparent gzip unwrap, line
 // splitting, format detection (or the forced --format), timestamp
 // resolution, --since/--until filtering, query filtering, and rendering.
@@ -260,10 +336,10 @@ type bufferedRenderer interface {
 // per-source (§9.2: "Detection cached per file"), never shared across
 // multiple files in one run. A non-nil err is a fatal read/write failure;
 // the caller stops the whole run on it (exit 4).
-func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time) (linesRead, malformed, droppedByWindow int, err error) {
+func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time) (linesRead, malformed, droppedByWindow int, done bool, err error) {
 	gzr, err := formats.MaybeGunzip(src)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	lr := formats.NewLineReader(gzr, 0)
 
@@ -279,16 +355,20 @@ func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFi
 	default: // "auto"
 		detected, s, detErr := formats.DetectFromReader(lr)
 		if detErr != nil {
-			return 0, 0, 0, detErr
+			return 0, 0, 0, false, detErr
 		}
 		srcFormat, sample = detected, s
 	}
 
-	process := func(line []byte) error {
+	// process reports stop=true once the shared pipeline has signaled it
+	// will never accept another record (e.g. limit's count reached) — the
+	// caller then stops reading this source, and run() stops opening any
+	// further ones too.
+	process := func(line []byte) (stop bool, err error) {
 		linesRead++
-		outcome, werr := processLine(out, buffered, cf, now, line, srcFormat, loc, since, until, output)
+		outcome, pipelineDone, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, srcFormat, loc, since, until, output)
 		if werr != nil {
-			return werr
+			return false, werr
 		}
 		switch outcome {
 		case outcomeMalformed:
@@ -296,33 +376,41 @@ func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFi
 		case outcomeDroppedByWindow:
 			droppedByWindow++
 		}
-		return nil
+		return pipelineDone, nil
 	}
 
 	// The sample lines were already consumed from lr during auto-detection
 	// (or is empty, when forcedFormat skipped detection entirely) — they
 	// must be processed before reading any further, or they'd be lost.
 	for _, line := range sample {
-		if werr := process(line); werr != nil {
-			return linesRead, malformed, droppedByWindow, werr
+		stop, werr := process(line)
+		if werr != nil {
+			return linesRead, malformed, droppedByWindow, false, werr
+		}
+		if stop {
+			return linesRead, malformed, droppedByWindow, true, nil
 		}
 	}
 	for {
 		line, lerr := lr.ReadLine()
 		if line != nil {
-			if werr := process(line); werr != nil {
-				return linesRead, malformed, droppedByWindow, werr
+			stop, werr := process(line)
+			if werr != nil {
+				return linesRead, malformed, droppedByWindow, false, werr
+			}
+			if stop {
+				return linesRead, malformed, droppedByWindow, true, nil
 			}
 		}
 		if lerr != nil {
 			if lerr != io.EOF {
-				return linesRead, malformed, droppedByWindow, lerr
+				return linesRead, malformed, droppedByWindow, false, lerr
 			}
 			break
 		}
 	}
 
-	return linesRead, malformed, droppedByWindow, nil
+	return linesRead, malformed, droppedByWindow, false, nil
 }
 
 // lineOutcome distinguishes why a line didn't produce output, for the
@@ -338,12 +426,15 @@ const (
 
 // processLine decodes one line under the given format, resolves its
 // timestamp, applies --since/--until, evaluates the compiled query
-// filter, and renders it if everything passes. err is non-nil only for a
-// genuine write failure to out, which the caller treats as fatal.
-func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string) (outcome lineOutcome, err error) {
+// filter, runs the record through the pipeline stages, and renders it if
+// everything passes. err is non-nil only for a genuine write failure to
+// out, which the caller treats as fatal. done propagates the pipeline's
+// own done signal (§ Stage: "no more input needs to be read at all") —
+// true once, for instance, limit's count has been reached.
+func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string) (outcome lineOutcome, done bool, err error) {
 	rec, decErr := decodeLine(line, format)
 	if decErr != nil {
-		return outcomeMalformed, nil
+		return outcomeMalformed, false, nil
 	}
 
 	if t, _, ok := eval.ResolveRecordTimestamp(rec, loc); ok {
@@ -356,28 +447,27 @@ func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilt
 		// EXCEPT under an explicit --since/--until bound, where they are
 		// dropped and counted rather than silently passed through.
 		if !rec.HasTime {
-			return outcomeDroppedByWindow, nil
+			return outcomeDroppedByWindow, false, nil
 		}
 		if since != nil && rec.Time.Before(*since) {
-			return outcomeDroppedByWindow, nil
+			return outcomeDroppedByWindow, false, nil
 		}
 		if until != nil && rec.Time.After(*until) {
-			return outcomeDroppedByWindow, nil
+			return outcomeDroppedByWindow, false, nil
 		}
 	}
 
 	if !cf.Eval(rec, now) {
-		return outcomeFilteredOut, nil
+		return outcomeFilteredOut, false, nil
 	}
-	switch output {
-	case "jsonl":
-		err = render.JSONL(out, rec)
-	case "table", "csv":
-		buffered.Add(rec)
-	default: // "raw"
-		err = render.Raw(out, line)
+
+	out2, keep, pipelineDone := pl.Process(rec)
+	if !keep {
+		return outcomeFilteredOut, pipelineDone, nil
 	}
-	return outcomeMatched, err
+
+	werr := renderRecord(out, buffered, out2, line, output, stagesPresent)
+	return outcomeMatched, pipelineDone, werr
 }
 
 // decodeLine dispatches to the right per-format decoder. FormatPlain can

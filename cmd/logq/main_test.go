@@ -414,17 +414,108 @@ func TestRun_UntilAcceptsTheLiteralNow(t *testing.T) {
 	}
 }
 
-func TestRun_PipelineStagesRejectedNotSilentlyIgnored(t *testing.T) {
-	// Regression: q.Stages exists (parses fine, commit 23) but nothing
-	// executes it yet (commit 27) — a naive wiring would silently ignore
-	// "| fields a" and just run the bare filter, which is worse than an
-	// error: it would quietly not do what the user explicitly asked.
+func TestRun_FieldsStageActuallyProjects(t *testing.T) {
+	// Was a regression guard (commit 26) for stages parsing but not being
+	// applied — now that they're wired (commit 27), this instead confirms
+	// the real behavior: "b" must NOT survive the projection.
 	stdin := `{"a":1,"b":2}` + "\n"
-	code, out, errOut := runCLI(t, []string{`exists(a) | fields a`}, stdin)
-	if code == exitOK {
-		t.Fatalf("exit = %d, out = %q — a stage that isn't actually applied must not silently succeed", code, out)
+	code, out, errOut := runCLI(t, []string{"-o", "jsonl", `exists(a) | fields a`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
 	}
-	if !strings.Contains(errOut, "not yet wired") {
-		t.Fatalf("errOut = %q, want a clear not-yet-wired message", errOut)
+	if strings.TrimRight(out, "\n") != `{"a":1}` {
+		t.Fatalf("out = %q, want {\"a\":1} — field b must be projected away", out)
+	}
+}
+
+func TestRun_LimitStageActuallyLimits(t *testing.T) {
+	stdin := `{"n":1}` + "\n" + `{"n":2}` + "\n" + `{"n":3}` + "\n"
+	code, out, errOut := runCLI(t, []string{"-o", "jsonl", `exists(n) | limit 2`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want exactly 2 (limit 2):\n%s", len(lines), out)
+	}
+}
+
+func TestRun_LimitStopsReadingLaterFilesEntirely(t *testing.T) {
+	// The pipeline is ONE shared instance across every source — limit's
+	// count must apply across files, not restart per file, and once
+	// satisfied it should stop opening later files at all.
+	dir := t.TempDir()
+	f1 := filepath.Join(dir, "a.jsonl")
+	f2 := filepath.Join(dir, "b.jsonl")
+	if err := os.WriteFile(f1, []byte(`{"n":1}`+"\n"+`{"n":2}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.WriteFile(f2, []byte(`{"n":999}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	code, out, errOut := runCLI(t, []string{"-o", "jsonl", `exists(n) | limit 2`, f1, f2}, "")
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.Contains(out, "999") {
+		t.Fatalf("out = %q, want file b.jsonl never read at all once limit 2 was satisfied by a.jsonl", out)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines, want 2", len(lines))
+	}
+}
+
+func TestRun_SortStageActuallySorts(t *testing.T) {
+	stdin := `{"n":3}` + "\n" + `{"n":1}` + "\n" + `{"n":2}` + "\n"
+	code, out, errOut := runCLI(t, []string{"-o", "jsonl", `exists(n) | sort n asc limit 10`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	want := `{"n":1}` + "\n" + `{"n":2}` + "\n" + `{"n":3}` + "\n"
+	if out != want {
+		t.Fatalf("out = %q, want %q (sorted ascending)", out, want)
+	}
+}
+
+func TestRun_SortStageWithTableOutput(t *testing.T) {
+	// Proves sort's Flush-time output correctly reaches a *buffered*
+	// renderer too, not just raw/jsonl's streaming path.
+	stdin := `{"n":3}` + "\n" + `{"n":1}` + "\n"
+	code, out, errOut := runCLI(t, []string{"-o", "table", `exists(n) | sort n asc limit 10`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 3 { // header + 2 rows
+		t.Fatalf("got %d lines, want 3:\n%s", len(lines), out)
+	}
+}
+
+func TestRun_RawOutputFallsBackToJSONLWhenStagesPresent(t *testing.T) {
+	// §11.6's byte-verbatim guarantee can't survive a fields projection —
+	// documented fallback: raw becomes jsonl serialization of the final
+	// record whenever any stage ran, rather than the stale original line.
+	stdin := `{"a":1,"b":2}` + "\n"
+	code, out, errOut := runCLI(t, []string{`exists(a) | fields a`}, stdin) // default -o raw
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"a":1}` {
+		t.Fatalf("out = %q, want the jsonl-fallback projected record, not the stale original line", out)
+	}
+}
+
+func TestRun_RawOutputStillByteVerbatimWithoutStages(t *testing.T) {
+	// Sanity check that the fallback above didn't regress the ordinary,
+	// no-stages case: raw output must still be the untouched source line.
+	stdin := `{"b":2,"a":1}` + "\n" // deliberately non-canonical key order
+	code, out, errOut := runCLI(t, []string{`exists(a)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"b":2,"a":1}` {
+		t.Fatalf("out = %q, want the byte-identical original line", out)
 	}
 }

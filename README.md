@@ -103,6 +103,21 @@ logq --tz America/New_York 'exists(ts)' app.jsonl
 # if you need to keep that distinction)
 logq -o table 'level == "error"' app.jsonl
 logq -o csv 'level == "error"' app.jsonl
+
+# pipeline stages, chained left to right: project fields, then sort
+logq -o jsonl 'level == "error" | fields ts, msg' app.jsonl
+logq -o jsonl 'status >= 500 | sort status desc limit 10' app.jsonl
+
+# limit (bare, or via sort ... limit) stops reading input as soon as it's
+# satisfied — including skipping any FURTHER files entirely, since the
+# pipeline is one shared instance across the whole run, not per file
+logq -o jsonl 'exists(n) | limit 5' a.jsonl b.jsonl c.jsonl
+
+# once any stage runs, -o raw's byte-for-byte guarantee no longer makes
+# sense (a stage may have transformed the record entirely) — it falls
+# back to jsonl serialization of the final record instead, uniformly:
+logq 'level == "error" | fields msg' app.jsonl   # prints jsonl, not raw bytes
+logq 'level == "error"' app.jsonl                 # no stages: still true byte-verbatim raw
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -155,12 +170,13 @@ full spec:
   in memory before printing anything; their natural use case (once stats
   lands, Phase 8) is already-bounded aggregate output, where this doesn't
   matter.
-- **Pipeline stages:** the grammar and the `fields`/`sort`/`limit` stage
-  implementations exist (parsed and independently tested), but aren't
-  wired into the live CLI pipeline yet — that's the very next commit.
-  `stats` itself lands in Phase 8. A query today is still a filter
-  expression only end-to-end; piping to any stage (`| fields ...`) parses
-  correctly but has no effect on the CLI's actual output yet.
+- **Pipeline stages:** `fields`, `sort`, and `limit` are fully wired now
+  (Phase 7 complete) — `limit`/a bounded `sort ... limit N` even stop
+  reading further input (including later files entirely) once satisfied,
+  since the pipeline is one shared instance across the whole run, not
+  rebuilt per file. `stats` still lands in Phase 8; `| stats ...` fails
+  with an explicit "not implemented yet" error rather than being silently
+  ignored.
 - **Time features:** `--tz`/`--since`/`--until` and real timestamp
   auto-detection (via the field-priority ladder, exposed as the virtual
   `ts` path) are implemented now (Phase 6 complete). `now` is frozen once
