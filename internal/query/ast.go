@@ -113,10 +113,7 @@ func (*Exists) exprNode()  {}
 func (*Lit) exprNode()     {}
 func (*PathRef) exprNode() {}
 
-// Stage is implemented by each pipeline stage kind. FieldsStage,
-// SortStage, and LimitStage land here (commit 23); StatsStage lands in
-// Phase 8 (commit 28) — until then a "stats" keyword after a "|" is a
-// clear "not implemented yet" parse error, not silently ignored.
+// Stage is implemented by each pipeline stage kind.
 type Stage interface{ stageNode() }
 
 // FieldsStage projects a record down to just the listed paths.
@@ -148,9 +145,47 @@ type LimitStage struct {
 	Limit int64
 }
 
+// StatFnKind identifies the kind of aggregation function in a StatFn.
+type StatFnKind int
+
+const (
+	StatCount StatFnKind = iota
+	StatCountDistinct
+	StatSum
+	StatAvg
+	StatMin
+	StatMax
+	StatP50
+	StatP95
+	StatP99
+)
+
+// StatFn is one aggregation function call within a StatsStage, e.g.
+// count(), count_distinct(url), sum(duration_ms), p95(latency). Path is
+// nil only for StatCount, the sole zero-argument function.
+type StatFn struct {
+	Kind StatFnKind
+	Path *PathRef
+}
+
+// StatsStage is the terminal aggregation stage (§7/§8): one or more
+// StatFns, an optional "by" grouping path list, and an optional "every"
+// window duration. Every is kept as validated raw text (parsed once here
+// via time.ParseDuration purely to enforce S-1's 1ms–365d range at
+// compile time — unlike an ordinary Duration Lit elsewhere in the
+// grammar, whose parsing is deliberately deferred to the evaluator) so
+// the aggregation engine (Phase 8's internal/agg) can re-parse it without
+// this package needing to export a time.Duration-shaped field.
+type StatsStage struct {
+	Fns   []StatFn
+	By    []*PathRef
+	Every string // raw duration text, "" if "every" wasn't given
+}
+
 func (*FieldsStage) stageNode() {}
 func (*SortStage) stageNode()   {}
 func (*LimitStage) stageNode()  {}
+func (*StatsStage) stageNode()  {}
 
 // Query is the top-level parsed query: an optional FilterExpr followed by
 // zero or more pipeline stages, applied left to right.

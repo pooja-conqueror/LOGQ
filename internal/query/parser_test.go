@@ -293,13 +293,22 @@ func TestParse_IllegalLexTokenPropagates(t *testing.T) {
 	}
 }
 
-func TestParseQuery_BareStagePipeNotYetSupported(t *testing.T) {
-	_, err := ParseQuery(`| stats count() by remote_addr`)
-	if err == nil {
-		t.Fatal("want an error: pipeline stages are not implemented yet")
+func TestParseQuery_BareStagePipeParsesStatsNow(t *testing.T) {
+	// Was a "not implemented yet" guard (commit 6) before StatsStage
+	// existed (commit 28) — now confirms the real parse.
+	q, err := ParseQuery(`| stats count() by remote_addr`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "not implemented yet") {
-		t.Fatalf("err = %v, want a not-implemented-yet message", err)
+	ss, ok := q.Stages[0].(*StatsStage)
+	if !ok {
+		t.Fatalf("Stages[0] = %#v, want *StatsStage", q.Stages[0])
+	}
+	if len(ss.Fns) != 1 || ss.Fns[0].Kind != StatCount {
+		t.Fatalf("Fns = %#v, want [count()]", ss.Fns)
+	}
+	if len(ss.By) != 1 || ss.By[0].Segs[0].Ident != "remote_addr" {
+		t.Fatalf("By = %#v, want [remote_addr]", ss.By)
 	}
 }
 
@@ -464,10 +473,16 @@ func TestParseQuery_UnknownStageKeyword(t *testing.T) {
 	}
 }
 
-func TestParseQuery_StatsAfterFilterStillNotImplemented(t *testing.T) {
-	_, err := ParseQuery(`level == "error" | stats count()`)
-	if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
-		t.Fatalf("err = %v, want a not-implemented-yet message for stats", err)
+func TestParseQuery_StatsAfterFilterParsesNow(t *testing.T) {
+	q, err := ParseQuery(`level == "error" | stats count()`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	if len(q.Stages) != 1 {
+		t.Fatalf("Stages = %#v, want 1 stage", q.Stages)
+	}
+	if _, ok := q.Filter.(*Cmp); !ok {
+		t.Fatalf("Filter = %#v, want *Cmp", q.Filter)
 	}
 }
 
@@ -475,5 +490,183 @@ func TestParseQuery_TrailingGarbageAfterStage(t *testing.T) {
 	_, err := ParseQuery(`| limit 5 extra`)
 	if err == nil {
 		t.Fatal("trailing garbage after a valid stage should still fail")
+	}
+}
+
+// --- StatsStage (commit 28) -------------------------------------------
+
+func mustStats(t *testing.T, src string) *StatsStage {
+	t.Helper()
+	q, err := ParseQuery(src)
+	if err != nil {
+		t.Fatalf("ParseQuery(%q) error = %v", src, err)
+	}
+	ss, ok := q.Stages[0].(*StatsStage)
+	if !ok {
+		t.Fatalf("Stages[0] = %#v, want *StatsStage", q.Stages[0])
+	}
+	return ss
+}
+
+func TestParseQuery_StatFn_AllForms(t *testing.T) {
+	cases := []struct {
+		src      string
+		wantKind StatFnKind
+		wantPath string // "" for count(), which has no path
+	}{
+		{`| stats count()`, StatCount, ""},
+		{`| stats count_distinct(url)`, StatCountDistinct, "url"},
+		{`| stats sum(duration_ms)`, StatSum, "duration_ms"},
+		{`| stats avg(duration_ms)`, StatAvg, "duration_ms"},
+		{`| stats min(duration_ms)`, StatMin, "duration_ms"},
+		{`| stats max(duration_ms)`, StatMax, "duration_ms"},
+		{`| stats p50(duration_ms)`, StatP50, "duration_ms"},
+		{`| stats p95(duration_ms)`, StatP95, "duration_ms"},
+		{`| stats p99(duration_ms)`, StatP99, "duration_ms"},
+	}
+	for _, c := range cases {
+		t.Run(c.src, func(t *testing.T) {
+			ss := mustStats(t, c.src)
+			if len(ss.Fns) != 1 {
+				t.Fatalf("Fns = %#v, want 1 function", ss.Fns)
+			}
+			fn := ss.Fns[0]
+			if fn.Kind != c.wantKind {
+				t.Fatalf("Kind = %v, want %v", fn.Kind, c.wantKind)
+			}
+			if c.wantPath == "" {
+				if fn.Path != nil {
+					t.Fatalf("Path = %#v, want nil for count()", fn.Path)
+				}
+			} else {
+				if fn.Path == nil || fn.Path.Segs[0].Ident != c.wantPath {
+					t.Fatalf("Path = %#v, want %q", fn.Path, c.wantPath)
+				}
+			}
+		})
+	}
+}
+
+func TestParseQuery_StatFn_CountRequiresEmptyParens(t *testing.T) {
+	// Every example query in both source spec documents writes "count()"
+	// with parens, resolving the grammar's own internal ambiguity — a
+	// bare "count" with no parens at all must NOT parse.
+	if _, err := ParseQuery(`| stats count`); err == nil {
+		t.Fatal("bare 'count' with no parens should fail to parse")
+	}
+	if _, err := ParseQuery(`| stats count(x)`); err == nil {
+		t.Fatal("'count(x)' should fail — count takes no argument")
+	}
+}
+
+func TestParseQuery_StatsStage_MultipleFunctions(t *testing.T) {
+	ss := mustStats(t, `| stats count(), p95(duration_ms), sum(bytes)`)
+	if len(ss.Fns) != 3 {
+		t.Fatalf("Fns = %#v, want 3", ss.Fns)
+	}
+	if ss.Fns[0].Kind != StatCount || ss.Fns[1].Kind != StatP95 || ss.Fns[2].Kind != StatSum {
+		t.Fatalf("Fns = %#v, want [count p95 sum] in order", ss.Fns)
+	}
+}
+
+func TestParseQuery_StatsStage_ByMultiplePaths(t *testing.T) {
+	ss := mustStats(t, `| stats count() by service, url.path`)
+	if len(ss.By) != 2 {
+		t.Fatalf("By = %#v, want 2 paths", ss.By)
+	}
+	if ss.By[0].Segs[0].Ident != "service" {
+		t.Fatalf("By[0] = %#v", ss.By[0])
+	}
+	if len(ss.By[1].Segs) != 2 || ss.By[1].Segs[1].Ident != "path" {
+		t.Fatalf("By[1] = %#v, want url.path", ss.By[1])
+	}
+}
+
+func TestParseQuery_StatsStage_Every(t *testing.T) {
+	ss := mustStats(t, `| stats count() by service every 1m`)
+	if ss.Every != "1m" {
+		t.Fatalf("Every = %q, want %q", ss.Every, "1m")
+	}
+}
+
+func TestParseQuery_StatsStage_EveryWithoutBy(t *testing.T) {
+	// "by" is optional independent of "every" — a global window with no
+	// grouping is valid grammar.
+	ss := mustStats(t, `| stats count() every 5m`)
+	if len(ss.By) != 0 {
+		t.Fatalf("By = %#v, want none", ss.By)
+	}
+	if ss.Every != "5m" {
+		t.Fatalf("Every = %q, want 5m", ss.Every)
+	}
+}
+
+func TestParseQuery_StatsStage_EveryRangeTooSmall(t *testing.T) {
+	// S-1: every must be >= 1ms.
+	if _, err := ParseQuery(`| stats count() every 500us`); err == nil {
+		t.Fatal("every 500us (< 1ms) should be rejected by S-1")
+	}
+}
+
+func TestParseQuery_StatsStage_EveryRangeTooLarge(t *testing.T) {
+	// S-1: every must be <= 365d.
+	if _, err := ParseQuery(`| stats count() every 400d`); err == nil {
+		t.Fatal("every 400d (> 365d) should be rejected by S-1")
+	}
+}
+
+func TestParseQuery_StatsStage_EveryRangeBoundsInclusive(t *testing.T) {
+	// Exactly 1ms and exactly 365d must both be VALID (inclusive bounds).
+	if _, err := ParseQuery(`| stats count() every 1ms`); err != nil {
+		t.Fatalf("every 1ms (exactly the minimum) should be valid, got: %v", err)
+	}
+	if _, err := ParseQuery(`| stats count() every 8760h`); err != nil { // 365*24h
+		t.Fatalf("every 8760h (exactly 365d) should be valid, got: %v", err)
+	}
+}
+
+func TestParseQuery_StatsStage_DuplicateFunctionRejected(t *testing.T) {
+	// S-6: duplicate stat-function+path pairs are ambiguous output columns.
+	if _, err := ParseQuery(`| stats count(), count()`); err == nil {
+		t.Fatal("duplicate count() should be rejected (S-6)")
+	}
+	if _, err := ParseQuery(`| stats sum(x), sum(x)`); err == nil {
+		t.Fatal("duplicate sum(x) should be rejected (S-6)")
+	}
+}
+
+func TestParseQuery_StatsStage_SameFunctionDifferentPathAllowed(t *testing.T) {
+	// sum(x) and sum(y) are distinct output columns — not a duplicate.
+	ss := mustStats(t, `| stats sum(x), sum(y)`)
+	if len(ss.Fns) != 2 {
+		t.Fatalf("Fns = %#v, want 2 distinct functions", ss.Fns)
+	}
+}
+
+func TestParseQuery_StatsStage_MustBeTerminal(t *testing.T) {
+	// S-5: no stage may follow stats.
+	if _, err := ParseQuery(`| stats count() | fields x`); err == nil {
+		t.Fatal("'stats ... | fields ...' should be rejected — stats must be terminal (S-5)")
+	}
+	if _, err := ParseQuery(`| stats count() | limit 5`); err == nil {
+		t.Fatal("'stats ... | limit ...' should be rejected — stats must be terminal (S-5)")
+	}
+}
+
+func TestParseQuery_StatsStage_CanFollowOtherStages(t *testing.T) {
+	// The terminal restriction is one-directional: other stages may
+	// precede stats just fine.
+	q, err := ParseQuery(`| fields x | stats count()`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	if len(q.Stages) != 2 {
+		t.Fatalf("Stages = %#v, want 2", q.Stages)
+	}
+}
+
+func TestParseQuery_StatsStage_UnknownFunctionName(t *testing.T) {
+	if _, err := ParseQuery(`| stats median(x)`); err == nil {
+		t.Fatal("an unrecognized stat function name should fail to parse")
 	}
 }

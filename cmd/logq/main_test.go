@@ -519,3 +519,21 @@ func TestRun_RawOutputStillByteVerbatimWithoutStages(t *testing.T) {
 		t.Fatalf("out = %q, want the byte-identical original line", out)
 	}
 }
+
+func TestRun_StatsStageClearErrorNotInternalError(t *testing.T) {
+	// StatsStage parses fine as of commit 28, but buildPipeline has no
+	// aggregation engine to run it with yet (later in Phase 8) — must
+	// fail with a clear, specific message, not the generic "internal
+	// error: unrecognized stage type" fallback, which would read as an
+	// alarming bug report for what's actually an honest, expected gap.
+	code, _, errOut := runCLI(t, []string{`| stats count()`}, "")
+	if code != exitCompile {
+		t.Fatalf("exit = %d, want %d", code, exitCompile)
+	}
+	if strings.Contains(errOut, "internal error") {
+		t.Fatalf("errOut = %q, must not read as an internal error", errOut)
+	}
+	if !strings.Contains(errOut, "not implemented yet") {
+		t.Fatalf("errOut = %q, want a clear not-implemented-yet message", errOut)
+	}
+}

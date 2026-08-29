@@ -3,8 +3,17 @@ package query
 import (
 	"fmt"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/pooja-conqueror/LOGQ/internal/lex"
+)
+
+// minEveryDuration and maxEveryDuration implement S-1's range check on
+// StatsStage's "every" window: 1ms–365d, inclusive both ends.
+var (
+	minEveryDuration = time.Millisecond
+	maxEveryDuration = 365 * 24 * time.Hour
 )
 
 // maxParenDepth bounds recursion for nested parentheses so pathological
@@ -74,10 +83,9 @@ func (p *parser) errWithSuggest(pos lex.Pos, got string, candidates []string, fo
 }
 
 // ParseQuery parses a full query: an optional FilterExpr followed by zero
-// or more "|"-separated pipeline stages. StatsStage isn't implemented
-// until Phase 8 (commit 28) — a "stats" keyword after a "|" is rejected
-// with a clear, honest error rather than silently discarded; fields/sort/
-// limit are fully real as of this commit.
+// or more "|"-separated pipeline stages — fields, sort, limit, and stats
+// are all real grammar as of this commit (stats' actual aggregation
+// engine lands later in Phase 8; it parses correctly here regardless).
 func ParseQuery(src string) (*Query, error) {
 	p := newParser(src)
 	q := &Query{}
@@ -91,6 +99,16 @@ func ParseQuery(src string) (*Query, error) {
 	}
 
 	for p.cur.Kind == lex.Pipe {
+		// S-5: stats must be the terminal stage — checked here, before
+		// even attempting to parse whatever comes after this "|", so a
+		// query like `stats count() | fields x` fails with a clear,
+		// precisely-positioned error rather than a confusing one from
+		// deep inside fields parsing.
+		if len(q.Stages) > 0 {
+			if _, ok := q.Stages[len(q.Stages)-1].(*StatsStage); ok {
+				return nil, p.errf(p.cur.Pos, "'stats' must be the terminal stage — no stage may follow it")
+			}
+		}
 		p.advance()
 		stage, err := p.parseStage()
 		if err != nil {
@@ -122,7 +140,7 @@ func (p *parser) parseStage() (Stage, error) {
 	case lex.KwLimit:
 		return p.parseLimitStage()
 	case lex.KwStats:
-		return nil, p.errf(p.cur.Pos, "the 'stats' stage is not implemented yet")
+		return p.parseStatsStage()
 	case lex.Illegal:
 		return nil, p.illegalErr()
 	default:
@@ -202,6 +220,203 @@ func (p *parser) parsePosInt() (int64, error) {
 	}
 	p.advance()
 	return n, nil
+}
+
+// StatsStage = "stats", StatFn, { ",", StatFn },
+//
+//	[ "by", Path, { ",", Path } ], [ "every", DURATION ] ;
+//
+// The formal grammar text is ambiguous about whether bare "count" takes
+// parens at all (one source document writes "count()" as if it were a
+// single literal token; another writes bare "count" with no call syntax).
+// Every example query in both documents consistently writes "count()",
+// so that's the form implemented here — parens required uniformly for
+// every stat function, count() simply has an empty argument list.
+func (p *parser) parseStatsStage() (*StatsStage, error) {
+	p.advance() // "stats"
+
+	first, err := p.parseStatFn()
+	if err != nil {
+		return nil, err
+	}
+	fns := []StatFn{first}
+	for p.cur.Kind == lex.Comma {
+		p.advance()
+		next, err := p.parseStatFn()
+		if err != nil {
+			return nil, err
+		}
+		fns = append(fns, next)
+	}
+
+	// S-6: duplicate stat-function+path pairs are rejected — ambiguous
+	// output column names, same idea as S-8's duplicate check for fields.
+	seen := map[string]bool{}
+	for _, fn := range fns {
+		key := statFnKey(fn)
+		if seen[key] {
+			return nil, p.errf(p.cur.Pos, "duplicate stat function %q in stats stage", key)
+		}
+		seen[key] = true
+	}
+
+	ss := &StatsStage{Fns: fns}
+
+	if p.cur.Kind == lex.KwBy {
+		p.advance()
+		by, err := p.parsePath()
+		if err != nil {
+			return nil, err
+		}
+		ss.By = []*PathRef{by}
+		for p.cur.Kind == lex.Comma {
+			p.advance()
+			next, err := p.parsePath()
+			if err != nil {
+				return nil, err
+			}
+			ss.By = append(ss.By, next)
+		}
+	}
+
+	if p.cur.Kind == lex.KwEvery {
+		p.advance()
+		if p.cur.Kind != lex.Duration {
+			return nil, p.errf(p.cur.Pos, "expected a duration after 'every', got %q", p.cur.Text)
+		}
+		// S-1: "every" requires a duration between 1ms and 365d,
+		// inclusive — a static, compile-time range check, unlike an
+		// ordinary Duration Lit elsewhere in the grammar whose parsing is
+		// deliberately deferred to the evaluator (§5.3's Lit doc comment).
+		durText, durPos := p.cur.Text, p.cur.Pos
+		d, err := time.ParseDuration(durText)
+		if err != nil {
+			return nil, p.errf(durPos, "invalid duration %q after 'every': %v", durText, err)
+		}
+		if d < minEveryDuration || d > maxEveryDuration {
+			return nil, p.errf(durPos, "'every' duration %q must be between 1ms and 365d", durText)
+		}
+		ss.Every = durText
+		p.advance()
+	}
+
+	return ss, nil
+}
+
+// StatFn = "count", "(", ")"
+//
+//	| "count_distinct", "(", Path, ")"
+//	| ( "sum"|"avg"|"min"|"max" ), "(", Path, ")"
+//	| ( "p50"|"p95"|"p99" ), "(", Path, ")" ;
+func (p *parser) parseStatFn() (StatFn, error) {
+	kind, hasArg, ok := statFnKindFromToken(p.cur.Kind)
+	if !ok {
+		return StatFn{}, p.errf(p.cur.Pos, "expected a stat function (count, count_distinct, sum, avg, min, max, p50, p95, p99), got %q", p.cur.Text)
+	}
+	p.advance()
+
+	if p.cur.Kind != lex.LParen {
+		return StatFn{}, p.errf(p.cur.Pos, "expected '(' after stat function name")
+	}
+	p.advance()
+
+	var path *PathRef
+	if hasArg {
+		pr, err := p.parsePath()
+		if err != nil {
+			return StatFn{}, err
+		}
+		path = pr
+	}
+
+	if p.cur.Kind != lex.RParen {
+		return StatFn{}, p.errf(p.cur.Pos, "expected ')' to close stat function call")
+	}
+	p.advance()
+
+	return StatFn{Kind: kind, Path: path}, nil
+}
+
+func statFnKindFromToken(k lex.Kind) (kind StatFnKind, hasArg bool, ok bool) {
+	switch k {
+	case lex.KwCount:
+		return StatCount, false, true
+	case lex.KwCountDistinct:
+		return StatCountDistinct, true, true
+	case lex.KwSum:
+		return StatSum, true, true
+	case lex.KwAvg:
+		return StatAvg, true, true
+	case lex.KwMin:
+		return StatMin, true, true
+	case lex.KwMax:
+		return StatMax, true, true
+	case lex.KwP50:
+		return StatP50, true, true
+	case lex.KwP95:
+		return StatP95, true, true
+	case lex.KwP99:
+		return StatP99, true, true
+	default:
+		return 0, false, false
+	}
+}
+
+// statFnKey renders a StatFn to canonical text for S-6 duplicate
+// detection — e.g. "count()", "sum(duration_ms)".
+func statFnKey(fn StatFn) string {
+	name := statFnName(fn.Kind)
+	if fn.Path == nil {
+		return name + "()"
+	}
+	return name + "(" + pathText(fn.Path) + ")"
+}
+
+func statFnName(k StatFnKind) string {
+	switch k {
+	case StatCount:
+		return "count"
+	case StatCountDistinct:
+		return "count_distinct"
+	case StatSum:
+		return "sum"
+	case StatAvg:
+		return "avg"
+	case StatMin:
+		return "min"
+	case StatMax:
+		return "max"
+	case StatP50:
+		return "p50"
+	case StatP95:
+		return "p95"
+	case StatP99:
+		return "p99"
+	default:
+		return "?"
+	}
+}
+
+// pathText renders a PathRef to its flat dotted/bracket text form — e.g.
+// b.c, items[0]. A small, package-local duplicate of the equivalent logic
+// in internal/pipeline/fields.go's pathKey: query can't import pipeline
+// (pipeline already imports query), and this is small enough that a
+// shared helper isn't worth the awkward dependency direction.
+func pathText(p *PathRef) string {
+	var sb strings.Builder
+	for i, seg := range p.Segs {
+		if seg.IsIndex {
+			sb.WriteByte('[')
+			sb.WriteString(strconv.FormatInt(seg.Index, 10))
+			sb.WriteByte(']')
+			continue
+		}
+		if i > 0 {
+			sb.WriteByte('.')
+		}
+		sb.WriteString(seg.Ident)
+	}
+	return sb.String()
 }
 
 // ParseFilterExpr parses a bare FilterExpr with nothing else following —
