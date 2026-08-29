@@ -69,12 +69,30 @@ cat app.jsonl | logq 'level == "error"'
 
 # re-serialize matches as JSON instead of raw passthrough
 logq -o jsonl 'level == "error"' app.jsonl
+
+# logfmt and plain text work too — auto-detected, or forced explicitly
+logq 'level == "error"' app.log            # auto-detects jsonl/logfmt/plain
+logq -f logfmt 'level == "error"' app.log
+logq -f plain 'msg ~ "auth failed"' app.log
+
+# gzip-compressed sources are decompressed transparently, any format
+logq 'level == "error"' app.jsonl.gz
 ```
 
-`-f`/`--format` and `-o`/`--output` are wired but currently only accept
-`auto`/`jsonl` and `raw`/`jsonl` respectively — anything else fails fast
-with a clear "not yet supported" message rather than silently
-misbehaving. See Honest Limits below.
+`-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
+lines of *each source independently* and picks jsonl/logfmt/plain
+deterministically; a single line that doesn't fit disqualifies a format
+outright, no fuzzy scoring) or one of `jsonl`/`logfmt`/`plain` forced
+explicitly. `-o`/`--output` currently only accepts `raw`/`jsonl` — `table`/
+`csv` land in Phase 7. Anything else fails fast with a clear error rather
+than silently misbehaving.
+
+Auto-detection is genuinely all-or-nothing per the spec: if even one line
+in the sampled window doesn't fit a format, the whole source falls through
+to the next one in the cascade (jsonl → logfmt → plain). A source that's
+mostly clean JSONL with one corrupted line among the first 64 will
+therefore be detected as plain text, not jsonl-with-one-bad-line — force
+`-f jsonl` explicitly if that's not what you want.
 
 Results go to stdout only. Diagnostics (a query compile error, a per-run
 malformed-line count) go to stderr, never mixed into stdout.
@@ -99,8 +117,8 @@ just because one record has a different shape than the rest.
 Reflects what's actually implemented as of this commit, not the eventual
 full spec:
 
-- **Input formats:** JSONL only. logfmt, plain text, gzip transparency, and
-  format auto-detection all land in Phase 5.
+- **Input formats:** JSONL, logfmt, plain text, gzip transparency, and
+  auto-detection are all implemented now (Phase 5 complete).
 - **Output formats:** `raw` (byte-verbatim passthrough) and `jsonl`
   (re-serialized, key order preserved). `table` and `csv` land in Phase 7.
 - **Pipeline stages:** none yet — `stats`, `fields`, `sort`, `limit` all

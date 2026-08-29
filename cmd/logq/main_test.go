@@ -110,7 +110,12 @@ func TestRun_MalformedLinesSkippedNotFatal(t *testing.T) {
 not valid json at all
 {"level":"error","n":2}
 `
-	code, out, errOut := runCLI(t, []string{`level == "error"`}, stdin)
+	// -f jsonl bypasses auto-detection deliberately: this test isolates
+	// decode-time malformed-line handling from format detection, which is
+	// its own separate, already-well-tested concern (commit 19) — see
+	// TestRun_MalformedLineWithinSampleAffectsAutoDetection below for what
+	// happens to this exact fixture under auto mode instead.
+	code, out, errOut := runCLI(t, []string{"-f", "jsonl", `level == "error"`}, stdin)
 	if code != exitOK {
 		t.Fatalf("exit = %d, want %d (a malformed line must not abort the run)", code, exitOK)
 	}
@@ -166,13 +171,68 @@ func TestRun_DashMeansStdinAlongsideRealFiles(t *testing.T) {
 	}
 }
 
-func TestRun_UnsupportedFormatFlagRejectedCleanly(t *testing.T) {
-	code, _, errOut := runCLI(t, []string{"-f", "logfmt", `x == 1`}, "")
+func TestRun_UnrecognizedFormatFlagRejectedCleanly(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"-f", "xml", `x == 1`}, "")
 	if code != exitUsage {
 		t.Fatalf("exit = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(errOut, "not yet supported") {
-		t.Fatalf("stderr = %q, want a clear not-yet-supported message", errOut)
+	if !strings.Contains(errOut, "not recognized") {
+		t.Fatalf("stderr = %q, want a clear not-recognized message", errOut)
+	}
+}
+
+func TestRun_LogfmtFormatWorks(t *testing.T) {
+	stdin := "level=error msg=boom\nlevel=info msg=ok\n"
+	code, out, errOut := runCLI(t, []string{"-f", "logfmt", `level == "error"`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if strings.TrimRight(out, "\n") != "level=error msg=boom" {
+		t.Fatalf("out = %q", out)
+	}
+}
+
+func TestRun_PlainFormatWorks(t *testing.T) {
+	stdin := "auth failed for bob\nrequest completed ok\n"
+	code, out, errOut := runCLI(t, []string{"-f", "plain", `msg ~ "auth failed"`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if strings.TrimRight(out, "\n") != "auth failed for bob" {
+		t.Fatalf("out = %q", out)
+	}
+}
+
+func TestRun_AutoDetectsLogfmtWithoutForcing(t *testing.T) {
+	stdin := "level=error msg=boom\nlevel=info msg=ok\n"
+	code, out, errOut := runCLI(t, []string{`level == "error"`}, stdin) // no -f: auto
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if strings.TrimRight(out, "\n") != "level=error msg=boom" {
+		t.Fatalf("out = %q, want auto-detection to correctly identify logfmt", out)
+	}
+}
+
+func TestRun_MalformedLineWithinSampleAffectsAutoDetection(t *testing.T) {
+	// Documents a real, spec-faithful consequence of the deterministic
+	// cascade (§9.2): auto-detection requires EVERY sampled line to fit a
+	// format. A single malformed line among the first 64 makes the whole
+	// source fall through — here, all the way to plain, since this exact
+	// mix is neither valid JSONL (one broken line) nor valid logfmt (the
+	// two intact lines are JSON, and JSON's '{' isn't a valid logfmt key
+	// byte). This is why TestRun_MalformedLinesSkippedNotFatal forces
+	// -f jsonl explicitly instead of relying on auto-detection.
+	stdin := `{"level":"error","n":1}
+not valid json at all
+{"level":"error","n":2}
+`
+	code, out, errOut := runCLI(t, []string{`level == "error"`}, stdin) // no -f: auto
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want empty — under plain-format fallback there is no 'level' field to match", out)
 	}
 }
 

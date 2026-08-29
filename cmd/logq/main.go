@@ -11,6 +11,7 @@ import (
 
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 	"github.com/pooja-conqueror/LOGQ/internal/formats"
+	"github.com/pooja-conqueror/LOGQ/internal/logfmtx"
 	"github.com/pooja-conqueror/LOGQ/internal/query"
 	"github.com/pooja-conqueror/LOGQ/internal/render"
 )
@@ -34,8 +35,11 @@ Usage:
   logq [flags] 'QUERY' [FILE|- ...]
 
 Flags:
-  -f, --format FORMAT   input format: auto|jsonl (default auto — only jsonl
-                         decoding exists so far; logfmt/plain land in Phase 5)
+  -f, --format FORMAT   input format: auto|jsonl|logfmt|plain (default auto —
+                         sampled from the first 64 non-empty lines of each
+                         source independently). Gzip-compressed sources are
+                         detected and decompressed transparently regardless
+                         of --format.
   -o, --output FORMAT   output format: raw|jsonl (default raw — table/csv
                          land in Phase 7)
   -h, --help             show this help and exit
@@ -56,8 +60,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("logq", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print our own usage/errors, not flag's
 
-	format := fs.String("f", "auto", "input format: auto|jsonl")
-	fs.StringVar(format, "format", "auto", "input format: auto|jsonl")
+	format := fs.String("f", "auto", "input format: auto|jsonl|logfmt|plain")
+	fs.StringVar(format, "format", "auto", "input format: auto|jsonl|logfmt|plain")
 	output := fs.String("o", "raw", "output format: raw|jsonl")
 	fs.StringVar(output, "output", "raw", "output format: raw|jsonl")
 	help := fs.Bool("h", false, "show help")
@@ -85,8 +89,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	queryText, files := rest[0], rest[1:]
 
-	if *format != "auto" && *format != "jsonl" {
-		fmt.Fprintf(stderr, "logq: --format %q not yet supported (only auto/jsonl exist so far)\n", *format)
+	switch *format {
+	case "auto", "jsonl", "logfmt", "plain":
+	default:
+		fmt.Fprintf(stderr, "logq: --format %q not recognized (want auto|jsonl|logfmt|plain)\n", *format)
 		return exitUsage
 	}
 	if *output != "raw" && *output != "jsonl" {
@@ -125,27 +131,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	var totalLines, malformed int
 	for _, src := range sources {
-		lr := formats.NewLineReader(src, 0)
-		for {
-			line, lerr := lr.ReadLine()
-			if line != nil {
-				totalLines++
-				matched, werr := processLine(out, cf, now, line, *output)
-				if werr != nil {
-					fmt.Fprintf(stderr, "logq: write error: %v\n", werr)
-					return exitIO
-				}
-				if !matched {
-					malformed++
-				}
-			}
-			if lerr != nil {
-				if lerr != io.EOF {
-					fmt.Fprintf(stderr, "logq: read error: %v\n", lerr)
-					return exitIO
-				}
-				break
-			}
+		n, m, srcErr := processSource(out, cf, now, src, *format, *output)
+		totalLines += n
+		malformed += m
+		if srcErr != nil {
+			fmt.Fprintf(stderr, "logq: %v\n", srcErr)
+			return exitIO
 		}
 	}
 
@@ -165,27 +156,114 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// processLine decodes one line, evaluates the compiled filter, and renders
-// it if it matches. ok is false only when the line failed to decode
-// (malformed) — a line that decodes fine but simply doesn't match the
-// filter is an entirely ordinary outcome, not an error, and still counts
-// as ok. err is non-nil only for a genuine write failure to out, which the
-// caller treats as fatal (exit 4) rather than silently continuing.
-func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []byte, output string) (ok bool, err error) {
-	res, decErr := formats.DecodeLine(line, formats.DefaultMaxDepth)
+// processSource fully processes one source: transparent gzip unwrap, line
+// splitting, format detection (or the forced --format), filtering, and
+// rendering. It returns how many lines it read and how many were
+// malformed for THIS source — detection and its "auto" sampling are
+// per-source (§9.2: "Detection cached per file"), never shared across
+// multiple files in one run. A non-nil err is a fatal read/write failure;
+// the caller stops the whole run on it (exit 4).
+func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io.Reader, forcedFormat, output string) (linesRead, malformed int, err error) {
+	gzr, err := formats.MaybeGunzip(src)
+	if err != nil {
+		return 0, 0, err
+	}
+	lr := formats.NewLineReader(gzr, 0)
+
+	var srcFormat formats.Format
+	var sample [][]byte
+	switch forcedFormat {
+	case "jsonl":
+		srcFormat = formats.FormatJSONL
+	case "logfmt":
+		srcFormat = formats.FormatLogfmt
+	case "plain":
+		srcFormat = formats.FormatPlain
+	default: // "auto"
+		detected, s, detErr := formats.DetectFromReader(lr)
+		if detErr != nil {
+			return 0, 0, detErr
+		}
+		srcFormat, sample = detected, s
+	}
+
+	process := func(line []byte) error {
+		linesRead++
+		matched, werr := processLine(out, cf, now, line, srcFormat, output)
+		if werr != nil {
+			return werr
+		}
+		if !matched {
+			malformed++
+		}
+		return nil
+	}
+
+	// The sample lines were already consumed from lr during auto-detection
+	// (or is empty, when forcedFormat skipped detection entirely) — they
+	// must be processed before reading any further, or they'd be lost.
+	for _, line := range sample {
+		if werr := process(line); werr != nil {
+			return linesRead, malformed, werr
+		}
+	}
+	for {
+		line, lerr := lr.ReadLine()
+		if line != nil {
+			if werr := process(line); werr != nil {
+				return linesRead, malformed, werr
+			}
+		}
+		if lerr != nil {
+			if lerr != io.EOF {
+				return linesRead, malformed, lerr
+			}
+			break
+		}
+	}
+
+	return linesRead, malformed, nil
+}
+
+// processLine decodes one line under the given format, evaluates the
+// compiled filter, and renders it if it matches. ok is false only when the
+// line failed to decode (malformed) — a line that decodes fine but simply
+// doesn't match the filter is an entirely ordinary outcome, not an error,
+// and still counts as ok. err is non-nil only for a genuine write failure
+// to out, which the caller treats as fatal rather than silently
+// continuing.
+func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []byte, format formats.Format, output string) (ok bool, err error) {
+	rec, decErr := decodeLine(line, format)
 	if decErr != nil {
 		return false, nil
 	}
-	if !cf.Eval(res.Record, now) {
+	if !cf.Eval(rec, now) {
 		return true, nil
 	}
 	switch output {
 	case "jsonl":
-		err = render.JSONL(out, res.Record)
+		err = render.JSONL(out, rec)
 	default: // "raw"
 		err = render.Raw(out, line)
 	}
 	return true, err
+}
+
+// decodeLine dispatches to the right per-format decoder. FormatPlain can
+// never fail — there's nothing to parse, only to wrap.
+func decodeLine(line []byte, format formats.Format) (*eval.Record, error) {
+	switch format {
+	case formats.FormatLogfmt:
+		return logfmtx.DecodeLine(line)
+	case formats.FormatPlain:
+		return formats.DecodePlainLine(line), nil
+	default: // formats.FormatJSONL
+		res, err := formats.DecodeLine(line, formats.DefaultMaxDepth)
+		if err != nil {
+			return nil, err
+		}
+		return res.Record, nil
+	}
 }
 
 // openSources resolves the FILE positional args into readers: no files
