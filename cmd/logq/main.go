@@ -41,8 +41,11 @@ Flags:
                          source independently). Gzip-compressed sources are
                          detected and decompressed transparently regardless
                          of --format.
-  -o, --output FORMAT   output format: raw|jsonl (default raw — table/csv
-                         land in Phase 7)
+  -o, --output FORMAT   output format: raw|jsonl|table|csv (default raw).
+                         table/csv buffer every matched record — the header
+                         must print before any row, and depends on having
+                         seen the records first — so they cannot stream
+                         like raw/jsonl do; see README's Honest Limits.
       --tz ZONE          IANA zone for interpreting naive timestamps and for
                          --since/--until "now" (default UTC). The zone
                          database is embedded in this binary (time/tzdata) —
@@ -74,8 +77,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	format := fs.String("f", "auto", "input format: auto|jsonl|logfmt|plain")
 	fs.StringVar(format, "format", "auto", "input format: auto|jsonl|logfmt|plain")
-	output := fs.String("o", "raw", "output format: raw|jsonl")
-	fs.StringVar(output, "output", "raw", "output format: raw|jsonl")
+	output := fs.String("o", "raw", "output format: raw|jsonl|table|csv")
+	fs.StringVar(output, "output", "raw", "output format: raw|jsonl|table|csv")
 	tz := fs.String("tz", "UTC", "IANA zone for naive timestamps and --since/--until \"now\"")
 	since := fs.String("since", "", "drop records older than this (RFC3339 or a duration like -1h)")
 	until := fs.String("until", "", "drop records newer than this (RFC3339, \"now\", or a duration)")
@@ -110,8 +113,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: --format %q not recognized (want auto|jsonl|logfmt|plain)\n", *format)
 		return exitUsage
 	}
-	if *output != "raw" && *output != "jsonl" {
-		fmt.Fprintf(stderr, "logq: --output %q not yet supported (only raw/jsonl exist so far)\n", *output)
+	switch *output {
+	case "raw", "jsonl", "table", "csv":
+	default:
+		fmt.Fprintf(stderr, "logq: --output %q not recognized (want raw|jsonl|table|csv)\n", *output)
 		return exitUsage
 	}
 
@@ -154,6 +159,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
+	if len(q.Stages) > 0 {
+		// The grammar and stage implementations (fields/sort/limit) exist
+		// and are independently tested (Phase 7 so far), but nothing here
+		// yet actually runs them against real records — that's the very
+		// next commit. Silently ignoring a stage the user explicitly
+		// asked for would be worse than refusing to run at all.
+		fmt.Fprintln(stderr, "logq: pipeline stages are parsed but not yet wired into execution")
+		return exitCompile
+	}
 	cf, err := eval.Compile(q.Filter)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
@@ -170,14 +184,32 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	out := bufio.NewWriter(stdout)
 	defer out.Flush()
 
+	// table/csv can't stream row-by-row (the header must print before any
+	// row, and depends on having seen the records first) — buffered is
+	// nil for raw/jsonl, which still stream normally.
+	var buffered bufferedRenderer
+	switch *output {
+	case "table":
+		buffered = render.NewTable()
+	case "csv":
+		buffered = render.NewCSV()
+	}
+
 	var totalLines, malformed, droppedByWindow int
 	for _, src := range sources {
-		n, m, d, srcErr := processSource(out, cf, now, src, *format, *output, loc, sinceBound, untilBound)
+		n, m, d, srcErr := processSource(out, buffered, cf, now, src, *format, *output, loc, sinceBound, untilBound)
 		totalLines += n
 		malformed += m
 		droppedByWindow += d
 		if srcErr != nil {
 			fmt.Fprintf(stderr, "logq: %v\n", srcErr)
+			return exitIO
+		}
+	}
+
+	if buffered != nil {
+		if err := buffered.Flush(out); err != nil {
+			fmt.Fprintf(stderr, "logq: write error: %v\n", err)
 			return exitIO
 		}
 	}
@@ -213,6 +245,14 @@ func parseTimeBound(s string, now time.Time) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("%q is neither RFC3339, \"now\", nor a duration like -1h", s)
 }
 
+// bufferedRenderer is implemented by the output formats that can't stream
+// row-by-row (table, csv — see render.Table/render.CSV's doc comments for
+// why). nil for raw/jsonl, which render immediately per matched line.
+type bufferedRenderer interface {
+	Add(rec *eval.Record)
+	Flush(w io.Writer) error
+}
+
 // processSource fully processes one source: transparent gzip unwrap, line
 // splitting, format detection (or the forced --format), timestamp
 // resolution, --since/--until filtering, query filtering, and rendering.
@@ -220,7 +260,7 @@ func parseTimeBound(s string, now time.Time) (time.Time, error) {
 // per-source (§9.2: "Detection cached per file"), never shared across
 // multiple files in one run. A non-nil err is a fatal read/write failure;
 // the caller stops the whole run on it (exit 4).
-func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time) (linesRead, malformed, droppedByWindow int, err error) {
+func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time) (linesRead, malformed, droppedByWindow int, err error) {
 	gzr, err := formats.MaybeGunzip(src)
 	if err != nil {
 		return 0, 0, 0, err
@@ -246,7 +286,7 @@ func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io
 
 	process := func(line []byte) error {
 		linesRead++
-		outcome, werr := processLine(out, cf, now, line, srcFormat, loc, since, until, output)
+		outcome, werr := processLine(out, buffered, cf, now, line, srcFormat, loc, since, until, output)
 		if werr != nil {
 			return werr
 		}
@@ -300,7 +340,7 @@ const (
 // timestamp, applies --since/--until, evaluates the compiled query
 // filter, and renders it if everything passes. err is non-nil only for a
 // genuine write failure to out, which the caller treats as fatal.
-func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string) (outcome lineOutcome, err error) {
+func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string) (outcome lineOutcome, err error) {
 	rec, decErr := decodeLine(line, format)
 	if decErr != nil {
 		return outcomeMalformed, nil
@@ -332,6 +372,8 @@ func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []b
 	switch output {
 	case "jsonl":
 		err = render.JSONL(out, rec)
+	case "table", "csv":
+		buffered.Add(rec)
 	default: // "raw"
 		err = render.Raw(out, line)
 	}

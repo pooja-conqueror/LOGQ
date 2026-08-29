@@ -236,13 +236,35 @@ not valid json at all
 	}
 }
 
-func TestRun_UnsupportedOutputFlagRejectedCleanly(t *testing.T) {
-	code, _, errOut := runCLI(t, []string{"-o", "table", `x == 1`}, "")
+func TestRun_UnrecognizedOutputFlagRejectedCleanly(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"-o", "xml", `x == 1`}, "")
 	if code != exitUsage {
 		t.Fatalf("exit = %d, want %d", code, exitUsage)
 	}
-	if !strings.Contains(errOut, "not yet supported") {
+	if !strings.Contains(errOut, "not recognized") {
 		t.Fatalf("stderr = %q", errOut)
+	}
+}
+
+func TestRun_TableOutputWorks(t *testing.T) {
+	stdin := `{"level":"error","n":1}` + "\n" + `{"level":"info","n":2}` + "\n"
+	code, out, errOut := runCLI(t, []string{"-o", "table", `exists(n)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if !strings.Contains(out, "level") || !strings.Contains(out, "error") || !strings.Contains(out, "info") {
+		t.Fatalf("out = %q, want a table with header and both rows", out)
+	}
+}
+
+func TestRun_CSVOutputWorks(t *testing.T) {
+	stdin := `{"level":"error","n":1}` + "\n"
+	code, out, errOut := runCLI(t, []string{"-o", "csv", `exists(n)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if !strings.Contains(out, "level,n\r\n") || !strings.Contains(out, "error,1\r\n") {
+		t.Fatalf("out = %q, want RFC4180 CSV with header", out)
 	}
 }
 
@@ -389,5 +411,20 @@ func TestRun_UntilAcceptsTheLiteralNow(t *testing.T) {
 	}
 	if out == "" {
 		t.Fatal("a record from 2020 must be <= --until now")
+	}
+}
+
+func TestRun_PipelineStagesRejectedNotSilentlyIgnored(t *testing.T) {
+	// Regression: q.Stages exists (parses fine, commit 23) but nothing
+	// executes it yet (commit 27) — a naive wiring would silently ignore
+	// "| fields a" and just run the bare filter, which is worse than an
+	// error: it would quietly not do what the user explicitly asked.
+	stdin := `{"a":1,"b":2}` + "\n"
+	code, out, errOut := runCLI(t, []string{`exists(a) | fields a`}, stdin)
+	if code == exitOK {
+		t.Fatalf("exit = %d, out = %q — a stage that isn't actually applied must not silently succeed", code, out)
+	}
+	if !strings.Contains(errOut, "not yet wired") {
+		t.Fatalf("errOut = %q, want a clear not-yet-wired message", errOut)
 	}
 }

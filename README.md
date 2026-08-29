@@ -96,6 +96,13 @@ logq --until now --since -24h 'exists(ts)' app.jsonl
 # zone; the zone database is embedded in the binary (time/tzdata) —
 # works even on a host with no system tzdata installed at all
 logq --tz America/New_York 'exists(ts)' app.jsonl
+
+# -o table / -o csv: a human-scannable table (numeric columns
+# right-aligned, missing fields shown as "(missing)") or RFC 4180 CSV
+# (missing AND null both render as an empty cell — use -o jsonl instead
+# if you need to keep that distinction)
+logq -o table 'level == "error"' app.jsonl
+logq -o csv 'level == "error"' app.jsonl
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -138,12 +145,22 @@ full spec:
 
 - **Input formats:** JSONL, logfmt, plain text, gzip transparency, and
   auto-detection are all implemented now (Phase 5 complete).
-- **Output formats:** `raw` (byte-verbatim passthrough) and `jsonl`
-  (re-serialized, key order preserved). `table` and `csv` land in Phase 7.
-- **Pipeline stages:** none yet — `stats`, `fields`, `sort`, `limit` all
-  land in Phase 7/8. A query today is a filter expression only; piping to a
-  stage (`| stats ...`) fails with an explicit "not implemented yet" error
-  rather than being silently ignored.
+- **Output formats:** all four are implemented — `raw` (byte-verbatim
+  passthrough), `jsonl` (re-serialized, key order preserved), `table`
+  (aligned text via `text/tabwriter`, numeric columns right-aligned), and
+  `csv` (RFC 4180). `table`/`csv` buffer every matched record — unlike
+  `raw`/`jsonl`, they can't stream row-by-row, since the header must print
+  before any row and depends on having seen the records first. For a
+  truly huge passthrough result this means holding the whole result set
+  in memory before printing anything; their natural use case (once stats
+  lands, Phase 8) is already-bounded aggregate output, where this doesn't
+  matter.
+- **Pipeline stages:** the grammar and the `fields`/`sort`/`limit` stage
+  implementations exist (parsed and independently tested), but aren't
+  wired into the live CLI pipeline yet — that's the very next commit.
+  `stats` itself lands in Phase 8. A query today is still a filter
+  expression only end-to-end; piping to any stage (`| fields ...`) parses
+  correctly but has no effect on the CLI's actual output yet.
 - **Time features:** `--tz`/`--since`/`--until` and real timestamp
   auto-detection (via the field-priority ladder, exposed as the virtual
   `ts` path) are implemented now (Phase 6 complete). `now` is frozen once
