@@ -312,3 +312,168 @@ func TestParseQuery_FilterOnly(t *testing.T) {
 		t.Fatalf("Filter = %#v, want *Cmp", q.Filter)
 	}
 }
+
+// --- FieldsStage / SortStage / LimitStage (commit 23) ---------------------
+
+func TestParseQuery_FieldsStage_SinglePath(t *testing.T) {
+	q, err := ParseQuery(`level == "error" | fields msg`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	if len(q.Stages) != 1 {
+		t.Fatalf("Stages = %#v, want 1 stage", q.Stages)
+	}
+	fs, ok := q.Stages[0].(*FieldsStage)
+	if !ok || len(fs.Paths) != 1 || fs.Paths[0].Segs[0].Ident != "msg" {
+		t.Fatalf("Stages[0] = %#v, want FieldsStage{msg}", q.Stages[0])
+	}
+}
+
+func TestParseQuery_FieldsStage_MultiplePaths(t *testing.T) {
+	q, err := ParseQuery(`| fields a, b.c, items[0]`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	fs := q.Stages[0].(*FieldsStage)
+	if len(fs.Paths) != 3 {
+		t.Fatalf("Paths = %#v, want 3", fs.Paths)
+	}
+	if fs.Paths[0].Segs[0].Ident != "a" {
+		t.Fatalf("Paths[0] = %#v", fs.Paths[0])
+	}
+	if len(fs.Paths[1].Segs) != 2 || fs.Paths[1].Segs[1].Ident != "c" {
+		t.Fatalf("Paths[1] = %#v, want b.c", fs.Paths[1])
+	}
+	if !fs.Paths[2].Segs[1].IsIndex {
+		t.Fatalf("Paths[2] = %#v, want an index segment", fs.Paths[2])
+	}
+}
+
+func TestParseQuery_SortStage_Valid(t *testing.T) {
+	cases := []struct {
+		src       string
+		wantOrder SortOrder
+		wantLimit int64
+	}{
+		{`| sort ts limit 10`, SortAsc, 10}, // default order is asc
+		{`| sort ts asc limit 10`, SortAsc, 10},
+		{`| sort ts desc limit 5`, SortDesc, 5},
+	}
+	for _, c := range cases {
+		t.Run(c.src, func(t *testing.T) {
+			q, err := ParseQuery(c.src)
+			if err != nil {
+				t.Fatalf("ParseQuery(%q) error = %v", c.src, err)
+			}
+			ss, ok := q.Stages[0].(*SortStage)
+			if !ok {
+				t.Fatalf("Stages[0] = %#v, want *SortStage", q.Stages[0])
+			}
+			if ss.Order != c.wantOrder {
+				t.Fatalf("Order = %v, want %v", ss.Order, c.wantOrder)
+			}
+			if ss.Limit != c.wantLimit {
+				t.Fatalf("Limit = %d, want %d", ss.Limit, c.wantLimit)
+			}
+			if ss.Path.Segs[0].Ident != "ts" {
+				t.Fatalf("Path = %#v, want ts", ss.Path)
+			}
+		})
+	}
+}
+
+func TestParseQuery_SortStage_WithoutLimitIsParseTimeError(t *testing.T) {
+	// The constant-memory guarantee (S-2): sort without a bound is a
+	// grammar violation caught at parse time, never something that slips
+	// through to a runtime surprise later.
+	_, err := ParseQuery(`| sort ts`)
+	if err == nil {
+		t.Fatal("ParseQuery(| sort ts) should fail — sort requires 'limit N'")
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("error type = %T, want *ParseError", err)
+	}
+	if !strings.Contains(pe.Msg, "requires 'limit N'") {
+		t.Fatalf("Msg = %q, want a message about the missing limit", pe.Msg)
+	}
+}
+
+func TestParseQuery_SortStage_DescWithoutLimitStillErrors(t *testing.T) {
+	_, err := ParseQuery(`| sort ts desc`)
+	if err == nil {
+		t.Fatal("ParseQuery(| sort ts desc) should fail — still no 'limit N'")
+	}
+}
+
+func TestParseQuery_LimitStage_Valid(t *testing.T) {
+	q, err := ParseQuery(`| limit 20`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	ls, ok := q.Stages[0].(*LimitStage)
+	if !ok || ls.Limit != 20 {
+		t.Fatalf("Stages[0] = %#v, want LimitStage{20}", q.Stages[0])
+	}
+}
+
+func TestParseQuery_LimitStage_ZeroRejected(t *testing.T) {
+	// POSINT means >= 1, not >= 0.
+	if _, err := ParseQuery(`| limit 0`); err == nil {
+		t.Fatal("ParseQuery(| limit 0) should fail — POSINT requires >= 1")
+	}
+}
+
+func TestParseQuery_SortStage_LimitZeroRejected(t *testing.T) {
+	if _, err := ParseQuery(`| sort ts limit 0`); err == nil {
+		t.Fatal("ParseQuery(| sort ts limit 0) should fail")
+	}
+}
+
+func TestParseQuery_LimitStage_NegativeRejected(t *testing.T) {
+	// Lexically "-5" tokenizes as a single signed Number, still rejected
+	// by the POSINT >= 1 check.
+	if _, err := ParseQuery(`| limit -5`); err == nil {
+		t.Fatal("ParseQuery(| limit -5) should fail")
+	}
+}
+
+func TestParseQuery_ChainedStages(t *testing.T) {
+	q, err := ParseQuery(`level == "error" | fields msg, status | sort status desc limit 5`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	if len(q.Stages) != 2 {
+		t.Fatalf("Stages = %#v, want 2 stages", q.Stages)
+	}
+	if _, ok := q.Stages[0].(*FieldsStage); !ok {
+		t.Fatalf("Stages[0] = %#v, want *FieldsStage", q.Stages[0])
+	}
+	if _, ok := q.Stages[1].(*SortStage); !ok {
+		t.Fatalf("Stages[1] = %#v, want *SortStage", q.Stages[1])
+	}
+}
+
+func TestParseQuery_UnknownStageKeyword(t *testing.T) {
+	_, err := ParseQuery(`| bogus stuff`)
+	if err == nil {
+		t.Fatal("ParseQuery(| bogus stuff) should fail")
+	}
+	if !strings.Contains(err.Error(), "expected a pipeline stage") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParseQuery_StatsAfterFilterStillNotImplemented(t *testing.T) {
+	_, err := ParseQuery(`level == "error" | stats count()`)
+	if err == nil || !strings.Contains(err.Error(), "not implemented yet") {
+		t.Fatalf("err = %v, want a not-implemented-yet message for stats", err)
+	}
+}
+
+func TestParseQuery_TrailingGarbageAfterStage(t *testing.T) {
+	_, err := ParseQuery(`| limit 5 extra`)
+	if err == nil {
+		t.Fatal("trailing garbage after a valid stage should still fail")
+	}
+}

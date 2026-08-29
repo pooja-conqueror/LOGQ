@@ -73,12 +73,11 @@ func (p *parser) errWithSuggest(pos lex.Pos, got string, candidates []string, fo
 	}
 }
 
-// ParseQuery parses a full query: an optional FilterExpr followed by
-// pipeline stages. Stage grammar (StatsStage/FieldsStage/SortStage/
-// LimitStage) isn't implemented until Phase 7 (commit 23) — a "|" is
-// accepted syntactically (so `| stats ...`-only queries don't fail purely
-// on shape) but rejected with a clear, honest error rather than silently
-// discarded.
+// ParseQuery parses a full query: an optional FilterExpr followed by zero
+// or more "|"-separated pipeline stages. StatsStage isn't implemented
+// until Phase 8 (commit 28) — a "stats" keyword after a "|" is rejected
+// with a clear, honest error rather than silently discarded; fields/sort/
+// limit are fully real as of this commit.
 func ParseQuery(src string) (*Query, error) {
 	p := newParser(src)
 	q := &Query{}
@@ -91,9 +90,15 @@ func ParseQuery(src string) (*Query, error) {
 		q.Filter = filter
 	}
 
-	if p.cur.Kind == lex.Pipe {
-		return nil, p.errf(p.cur.Pos, "pipeline stages are not implemented yet")
+	for p.cur.Kind == lex.Pipe {
+		p.advance()
+		stage, err := p.parseStage()
+		if err != nil {
+			return nil, err
+		}
+		q.Stages = append(q.Stages, stage)
 	}
+
 	if p.cur.Kind == lex.Illegal {
 		return nil, p.illegalErr()
 	}
@@ -105,6 +110,98 @@ func ParseQuery(src string) (*Query, error) {
 		return nil, p.errf(p.cur.Pos, "unexpected trailing input %q", p.cur.Text)
 	}
 	return q, nil
+}
+
+// parseStage dispatches on the leading keyword of a "|"-separated stage.
+func (p *parser) parseStage() (Stage, error) {
+	switch p.cur.Kind {
+	case lex.KwFields:
+		return p.parseFieldsStage()
+	case lex.KwSort:
+		return p.parseSortStage()
+	case lex.KwLimit:
+		return p.parseLimitStage()
+	case lex.KwStats:
+		return nil, p.errf(p.cur.Pos, "the 'stats' stage is not implemented yet")
+	case lex.Illegal:
+		return nil, p.illegalErr()
+	default:
+		return nil, p.errf(p.cur.Pos, "expected a pipeline stage (fields, sort, limit, or stats), got %q", p.cur.Text)
+	}
+}
+
+// FieldsStage = "fields", Path, { ",", Path } ;
+func (p *parser) parseFieldsStage() (*FieldsStage, error) {
+	p.advance() // "fields"
+	first, err := p.parsePath()
+	if err != nil {
+		return nil, err
+	}
+	paths := []*PathRef{first}
+	for p.cur.Kind == lex.Comma {
+		p.advance()
+		next, err := p.parsePath()
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, next)
+	}
+	return &FieldsStage{Paths: paths}, nil
+}
+
+// SortStage = "sort", Path, [ "asc" | "desc" ], "limit", POSINT ;
+// "limit" is not optional here — see SortStage's doc comment.
+func (p *parser) parseSortStage() (*SortStage, error) {
+	p.advance() // "sort"
+	path, err := p.parsePath()
+	if err != nil {
+		return nil, err
+	}
+
+	order := SortAsc
+	switch p.cur.Kind {
+	case lex.KwAsc:
+		p.advance()
+	case lex.KwDesc:
+		order = SortDesc
+		p.advance()
+	}
+
+	if p.cur.Kind != lex.KwLimit {
+		return nil, p.errf(p.cur.Pos, "'sort' requires 'limit N' — sort without a bound has no constant-memory guarantee, so it isn't allowed")
+	}
+	p.advance() // "limit"
+
+	n, err := p.parsePosInt()
+	if err != nil {
+		return nil, err
+	}
+	return &SortStage{Path: path, Order: order, Limit: n}, nil
+}
+
+// LimitStage = "limit", POSINT ;
+func (p *parser) parseLimitStage() (*LimitStage, error) {
+	p.advance() // "limit"
+	n, err := p.parsePosInt()
+	if err != nil {
+		return nil, err
+	}
+	return &LimitStage{Limit: n}, nil
+}
+
+// parsePosInt parses a POSINT (a positive integer, >= 1) — the shared
+// "limit N" tail of both SortStage and LimitStage.
+func (p *parser) parsePosInt() (int64, error) {
+	if p.cur.Kind != lex.Number {
+		return 0, p.errf(p.cur.Pos, "expected a positive integer, got %q", p.cur.Text)
+	}
+	text, pos := p.cur.Text, p.cur.Pos
+	n, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || n < 1 {
+		return 0, p.errf(pos, "expected a positive integer (>= 1), got %q", text)
+	}
+	p.advance()
+	return n, nil
 }
 
 // ParseFilterExpr parses a bare FilterExpr with nothing else following —

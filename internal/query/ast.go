@@ -113,9 +113,48 @@ func (*Exists) exprNode()  {}
 func (*Lit) exprNode()     {}
 func (*PathRef) exprNode() {}
 
-// Query is the top-level parsed query. Pipeline stages (Stage = Stats |
-// Fields | Sort | Limit) are not implemented until Phase 7 (commit 23) —
-// until then ParseQuery accepts a bare FilterExpr only.
+// Stage is implemented by each pipeline stage kind. FieldsStage,
+// SortStage, and LimitStage land here (commit 23); StatsStage lands in
+// Phase 8 (commit 28) — until then a "stats" keyword after a "|" is a
+// clear "not implemented yet" parse error, not silently ignored.
+type Stage interface{ stageNode() }
+
+// FieldsStage projects a record down to just the listed paths.
+type FieldsStage struct {
+	Paths []*PathRef
+}
+
+// SortOrder is asc or desc for a SortStage.
+type SortOrder int
+
+const (
+	SortAsc SortOrder = iota
+	SortDesc
+)
+
+// SortStage sorts by Path (asc by default) and keeps only the first Limit
+// records. Limit is grammar-mandatory — there is no SortStage value
+// without one — which is what makes sort's constant-memory guarantee
+// (S-2) a parser-enforced fact, not a runtime convention someone could
+// forget to check.
+type SortStage struct {
+	Path  *PathRef
+	Order SortOrder
+	Limit int64
+}
+
+// LimitStage passes through only the first N records reaching it.
+type LimitStage struct {
+	Limit int64
+}
+
+func (*FieldsStage) stageNode() {}
+func (*SortStage) stageNode()   {}
+func (*LimitStage) stageNode()  {}
+
+// Query is the top-level parsed query: an optional FilterExpr followed by
+// zero or more pipeline stages, applied left to right.
 type Query struct {
 	Filter Expr // nil means "match every record"
+	Stages []Stage
 }
