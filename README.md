@@ -77,6 +77,25 @@ logq -f plain 'msg ~ "auth failed"' app.log
 
 # gzip-compressed sources are decompressed transparently, any format
 logq 'level == "error"' app.jsonl.gz
+
+# "ts" is a virtual field: it always means the record's resolved
+# timestamp (from whichever of ts/time/timestamp/@timestamp/t/eventTime
+# actually parsed), never a literal field that merely happens to be
+# named "ts" — compare it with a duration, relative to the run's frozen
+# "now" (never a raw timestamp string — there's no timestamp-literal
+# syntax in the language)
+logq 'level == "error" and ts >= -1h' app.jsonl
+logq 'exists(ts)' app.jsonl
+
+# --since/--until drop records outside a time window; a record with no
+# resolvable timestamp at all is dropped too, once either flag is set
+logq --since 2026-08-29T00:00:00Z 'level == "error"' app.jsonl
+logq --until now --since -24h 'exists(ts)' app.jsonl
+
+# --tz interprets naive (no zone offset) timestamps in a given IANA
+# zone; the zone database is embedded in the binary (time/tzdata) —
+# works even on a host with no system tzdata installed at all
+logq --tz America/New_York 'exists(ts)' app.jsonl
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -125,10 +144,11 @@ full spec:
   land in Phase 7/8. A query today is a filter expression only; piping to a
   stage (`| stats ...`) fails with an explicit "not implemented yet" error
   rather than being silently ignored.
-- **Time features:** no `--since`/`--until`/`--tz`, no timestamp
-  auto-detection from log fields yet (Phase 6). The timestamp±duration
-  coercion rule itself is implemented and tested at the evaluator level,
-  just not wired to real log timestamps yet.
+- **Time features:** `--tz`/`--since`/`--until` and real timestamp
+  auto-detection (via the field-priority ladder, exposed as the virtual
+  `ts` path) are implemented now (Phase 6 complete). `now` is frozen once
+  at process start — batch mode only; there's no watch mode yet for the
+  "re-evaluate `now` per poll tick" distinction to matter.
 - **Watch mode, signals, parallelism:** not yet (Phase 9).
 - **Error/summary model:** malformed lines are skipped and counted with a
   single stderr line at the end of a run; the full per-field counter

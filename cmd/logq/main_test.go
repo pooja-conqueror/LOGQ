@@ -256,3 +256,138 @@ func TestRun_StdoutIsResultsOnlyStderrIsDiagnosticsOnly(t *testing.T) {
 		t.Fatalf("stderr = %q, want empty on a clean run with no malformed lines", errOut)
 	}
 }
+
+// --- Phase 6: --tz / --since / --until / the virtual "ts" field ----------
+
+func TestRun_TzUsesEmbeddedTzdata(t *testing.T) {
+	// This is the actual point of the time/tzdata blank import in this
+	// commit: a named IANA zone must resolve even though this dev machine
+	// (Windows) has no guaranteed system tzdata of its own. If the blank
+	// import were missing or broken, time.LoadLocation here would fail
+	// and the run would exit 1, not 0.
+	stdin := `{"ts":"2026-08-29T12:00:00"}` + "\n" // naive, no zone offset
+	code, out, errOut := runCLI(t, []string{"--tz", "America/New_York", `exists(ts)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s) — is time/tzdata actually blank-imported?", code, exitOK, errOut)
+	}
+	if out == "" {
+		t.Fatal("expected the record to match exists(ts)")
+	}
+}
+
+func TestRun_InvalidTzRejectedCleanly(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--tz", "Not/A/Real/Zone", `x == 1`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(errOut, "invalid --tz") {
+		t.Fatalf("stderr = %q", errOut)
+	}
+}
+
+func TestRun_VirtualTsFieldQueryable(t *testing.T) {
+	// "ts" resolves via candidate-field priority regardless of which raw
+	// field actually supplied it — here "timestamp", not "ts" itself.
+	// exists(ts), not an inequality against a string literal: the query
+	// language has no timestamp-literal syntax at all (only relative
+	// durations like -1h via the Timestamp±Duration coercion), so
+	// exists() is the correct way to prove resolution succeeded.
+	stdin := `{"timestamp":"2026-08-29T12:00:00Z","msg":"a"}` + "\n"
+	code, out, errOut := runCLI(t, []string{`exists(ts)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if out == "" {
+		t.Fatal("expected the record to match exists(ts), resolved via the 'timestamp' field")
+	}
+
+	// Sanity: a record with NO resolvable timestamp field at all must not
+	// match exists(ts).
+	code2, out2, errOut2 := runCLI(t, []string{`exists(ts)`}, `{"msg":"no timestamp here"}`+"\n")
+	if code2 != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code2, errOut2)
+	}
+	if out2 != "" {
+		t.Fatalf("out = %q, want empty — no candidate timestamp field present", out2)
+	}
+}
+
+func TestRun_SinceDropsOlderRecords(t *testing.T) {
+	stdin := `{"ts":"2026-08-29T10:00:00Z","n":1}
+{"ts":"2026-08-29T13:00:00Z","n":2}
+`
+	// "now" is frozen at run start (real time, not 2026-08-29), so use an
+	// absolute RFC3339 --since bound rather than a relative duration —
+	// this isolates the since/until *filtering logic* from what "now"
+	// happens to be when the test executes.
+	code, out, errOut := runCLI(t, []string{"--since", "2026-08-29T12:00:00Z", `exists(n)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitOK, errOut)
+	}
+	if !strings.Contains(out, `"n":2`) || strings.Contains(out, `"n":1`) {
+		t.Fatalf("out = %q, want only the 13:00 record (n=2), not the 10:00 one", out)
+	}
+	if !strings.Contains(errOut, "1 dropped by --since/--until") {
+		t.Fatalf("errOut = %q, want the dropped-by-window count reported", errOut)
+	}
+}
+
+func TestRun_UntilDropsNewerRecords(t *testing.T) {
+	stdin := `{"ts":"2026-08-29T10:00:00Z","n":1}
+{"ts":"2026-08-29T13:00:00Z","n":2}
+`
+	code, out, errOut := runCLI(t, []string{"--until", "2026-08-29T12:00:00Z", `exists(n)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(out, `"n":1`) || strings.Contains(out, `"n":2`) {
+		t.Fatalf("out = %q, want only the 10:00 record (n=1)", out)
+	}
+}
+
+func TestRun_SinceUntilDropUnresolvableTimestamps(t *testing.T) {
+	// D-1: a record with no resolvable timestamp is normally never
+	// dropped for that reason alone — EXCEPT under an explicit
+	// --since/--until bound, where it's dropped and counted.
+	stdin := `{"msg":"no timestamp field at all"}` + "\n"
+
+	// Without --since/--until: passes through untouched.
+	code, out, _ := runCLI(t, []string{`exists(msg)`}, stdin)
+	if code != exitOK || out == "" {
+		t.Fatalf("without a window bound, a timestamp-less record must still match; exit=%d out=%q", code, out)
+	}
+
+	// With --since set: dropped, not matched, and counted.
+	code, out, errOut := runCLI(t, []string{"--since", "2026-01-01T00:00:00Z", `exists(msg)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want empty — a timestamp-less record must be dropped under --since", out)
+	}
+	if !strings.Contains(errOut, "1 dropped by --since/--until") {
+		t.Fatalf("errOut = %q, want the drop counted", errOut)
+	}
+}
+
+func TestRun_InvalidSinceRejectedCleanly(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--since", "not a valid bound", `x == 1`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(errOut, "invalid --since") {
+		t.Fatalf("stderr = %q", errOut)
+	}
+}
+
+func TestRun_UntilAcceptsTheLiteralNow(t *testing.T) {
+	// A record timestamped in the past must always be <= "now".
+	stdin := `{"ts":"2020-01-01T00:00:00Z","n":1}` + "\n"
+	code, out, errOut := runCLI(t, []string{"--until", "now", `exists(n)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if out == "" {
+		t.Fatal("a record from 2020 must be <= --until now")
+	}
+}

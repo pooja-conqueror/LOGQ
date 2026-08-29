@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"time"
+	_ "time/tzdata" // embed the IANA timezone database in the binary — see --tz below
 
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 	"github.com/pooja-conqueror/LOGQ/internal/formats"
@@ -42,6 +43,17 @@ Flags:
                          of --format.
   -o, --output FORMAT   output format: raw|jsonl (default raw — table/csv
                          land in Phase 7)
+      --tz ZONE          IANA zone for interpreting naive timestamps and for
+                         --since/--until "now" (default UTC). The zone
+                         database is embedded in this binary (time/tzdata) —
+                         works even on a host with no system tzdata at all.
+      --since BOUND      drop records older than BOUND; RFC3339 or a
+                         duration like -1h (relative to the run's frozen
+                         "now"). Records with no resolvable timestamp are
+                         dropped too when this is set.
+      --until BOUND      drop records newer than BOUND; RFC3339, "now", or
+                         a duration. Same drop-if-no-timestamp rule as
+                         --since.
   -h, --help             show this help and exit
       --version          show version and exit
 
@@ -64,6 +76,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.StringVar(format, "format", "auto", "input format: auto|jsonl|logfmt|plain")
 	output := fs.String("o", "raw", "output format: raw|jsonl")
 	fs.StringVar(output, "output", "raw", "output format: raw|jsonl")
+	tz := fs.String("tz", "UTC", "IANA zone for naive timestamps and --since/--until \"now\"")
+	since := fs.String("since", "", "drop records older than this (RFC3339 or a duration like -1h)")
+	until := fs.String("until", "", "drop records newer than this (RFC3339, \"now\", or a duration)")
 	help := fs.Bool("h", false, "show help")
 	fs.BoolVar(help, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -100,6 +115,37 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
+	loc, err := time.LoadLocation(*tz)
+	if err != nil {
+		fmt.Fprintf(stderr, "logq: invalid --tz %q: %v\n", *tz, err)
+		return exitUsage
+	}
+
+	// Frozen once, here, before any record is read — this is what
+	// batch-mode determinism (§15) and the timestamp±duration coercion
+	// both depend on, and what --since/--until "now"/relative durations
+	// are computed against. Watch mode (Phase 9) re-evaluates this per
+	// poll tick instead; everything today runs in batch mode.
+	now := time.Now()
+
+	var sinceBound, untilBound *time.Time
+	if *since != "" {
+		t, err := parseTimeBound(*since, now)
+		if err != nil {
+			fmt.Fprintf(stderr, "logq: invalid --since: %v\n", err)
+			return exitUsage
+		}
+		sinceBound = &t
+	}
+	if *until != "" {
+		t, err := parseTimeBound(*until, now)
+		if err != nil {
+			fmt.Fprintf(stderr, "logq: invalid --until: %v\n", err)
+			return exitUsage
+		}
+		untilBound = &t
+	}
+
 	// Query compilation happens entirely before any I/O — a bad query
 	// never even opens a file (§12.3: "Query compile fail: exit 2 before
 	// any I/O").
@@ -121,19 +167,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	defer closeAll()
 
-	// Frozen once, before any record is read — this is what batch-mode
-	// determinism (§15) and the timestamp±duration coercion both depend
-	// on. Watch mode (Phase 9) re-evaluates this per poll tick instead.
-	now := time.Now()
-
 	out := bufio.NewWriter(stdout)
 	defer out.Flush()
 
-	var totalLines, malformed int
+	var totalLines, malformed, droppedByWindow int
 	for _, src := range sources {
-		n, m, srcErr := processSource(out, cf, now, src, *format, *output)
+		n, m, d, srcErr := processSource(out, cf, now, src, *format, *output, loc, sinceBound, untilBound)
 		totalLines += n
 		malformed += m
+		droppedByWindow += d
 		if srcErr != nil {
 			fmt.Fprintf(stderr, "logq: %v\n", srcErr)
 			return exitIO
@@ -146,27 +188,42 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: write error: %v\n", err)
 		return exitIO
 	}
-	if malformed > 0 {
+	if malformed > 0 || droppedByWindow > 0 {
 		// A minimal placeholder for Phase 10's full per-field counter
-		// summary (internal/summarize) — line/malformed counts only, but
-		// still honest: a malformed line is never silently dropped
-		// without any trace.
-		fmt.Fprintf(stderr, "logq: %d line(s) read, %d malformed and skipped\n", totalLines, malformed)
+		// summary (internal/summarize) — a handful of counts only, but
+		// still honest: nothing is ever silently dropped without a trace.
+		fmt.Fprintf(stderr, "logq: %d line(s) read, %d malformed, %d dropped by --since/--until\n",
+			totalLines, malformed, droppedByWindow)
 	}
 	return exitOK
 }
 
+// parseTimeBound parses a --since/--until value: the literal "now", an
+// absolute RFC3339 timestamp, or a duration (e.g. "-1h") added to now.
+func parseTimeBound(s string, now time.Time) (time.Time, error) {
+	if s == "now" {
+		return now, nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return now.Add(d), nil
+	}
+	return time.Time{}, fmt.Errorf("%q is neither RFC3339, \"now\", nor a duration like -1h", s)
+}
+
 // processSource fully processes one source: transparent gzip unwrap, line
-// splitting, format detection (or the forced --format), filtering, and
-// rendering. It returns how many lines it read and how many were
-// malformed for THIS source — detection and its "auto" sampling are
+// splitting, format detection (or the forced --format), timestamp
+// resolution, --since/--until filtering, query filtering, and rendering.
+// It returns per-source counts — detection and its "auto" sampling are
 // per-source (§9.2: "Detection cached per file"), never shared across
 // multiple files in one run. A non-nil err is a fatal read/write failure;
 // the caller stops the whole run on it (exit 4).
-func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io.Reader, forcedFormat, output string) (linesRead, malformed int, err error) {
+func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time) (linesRead, malformed, droppedByWindow int, err error) {
 	gzr, err := formats.MaybeGunzip(src)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	lr := formats.NewLineReader(gzr, 0)
 
@@ -182,19 +239,22 @@ func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io
 	default: // "auto"
 		detected, s, detErr := formats.DetectFromReader(lr)
 		if detErr != nil {
-			return 0, 0, detErr
+			return 0, 0, 0, detErr
 		}
 		srcFormat, sample = detected, s
 	}
 
 	process := func(line []byte) error {
 		linesRead++
-		matched, werr := processLine(out, cf, now, line, srcFormat, output)
+		outcome, werr := processLine(out, cf, now, line, srcFormat, loc, since, until, output)
 		if werr != nil {
 			return werr
 		}
-		if !matched {
+		switch outcome {
+		case outcomeMalformed:
 			malformed++
+		case outcomeDroppedByWindow:
+			droppedByWindow++
 		}
 		return nil
 	}
@@ -204,41 +264,70 @@ func processSource(out io.Writer, cf *eval.CompiledFilter, now time.Time, src io
 	// must be processed before reading any further, or they'd be lost.
 	for _, line := range sample {
 		if werr := process(line); werr != nil {
-			return linesRead, malformed, werr
+			return linesRead, malformed, droppedByWindow, werr
 		}
 	}
 	for {
 		line, lerr := lr.ReadLine()
 		if line != nil {
 			if werr := process(line); werr != nil {
-				return linesRead, malformed, werr
+				return linesRead, malformed, droppedByWindow, werr
 			}
 		}
 		if lerr != nil {
 			if lerr != io.EOF {
-				return linesRead, malformed, lerr
+				return linesRead, malformed, droppedByWindow, lerr
 			}
 			break
 		}
 	}
 
-	return linesRead, malformed, nil
+	return linesRead, malformed, droppedByWindow, nil
 }
 
-// processLine decodes one line under the given format, evaluates the
-// compiled filter, and renders it if it matches. ok is false only when the
-// line failed to decode (malformed) — a line that decodes fine but simply
-// doesn't match the filter is an entirely ordinary outcome, not an error,
-// and still counts as ok. err is non-nil only for a genuine write failure
-// to out, which the caller treats as fatal rather than silently
-// continuing.
-func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []byte, format formats.Format, output string) (ok bool, err error) {
+// lineOutcome distinguishes why a line didn't produce output, for the
+// caller's counters.
+type lineOutcome int
+
+const (
+	outcomeMatched lineOutcome = iota
+	outcomeFilteredOut
+	outcomeMalformed
+	outcomeDroppedByWindow
+)
+
+// processLine decodes one line under the given format, resolves its
+// timestamp, applies --since/--until, evaluates the compiled query
+// filter, and renders it if everything passes. err is non-nil only for a
+// genuine write failure to out, which the caller treats as fatal.
+func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string) (outcome lineOutcome, err error) {
 	rec, decErr := decodeLine(line, format)
 	if decErr != nil {
-		return false, nil
+		return outcomeMalformed, nil
 	}
+
+	if t, _, ok := eval.ResolveRecordTimestamp(rec, loc); ok {
+		rec.Time = t
+		rec.HasTime = true
+	}
+
+	if since != nil || until != nil {
+		// D-1: records are never dropped for an unresolvable timestamp
+		// EXCEPT under an explicit --since/--until bound, where they are
+		// dropped and counted rather than silently passed through.
+		if !rec.HasTime {
+			return outcomeDroppedByWindow, nil
+		}
+		if since != nil && rec.Time.Before(*since) {
+			return outcomeDroppedByWindow, nil
+		}
+		if until != nil && rec.Time.After(*until) {
+			return outcomeDroppedByWindow, nil
+		}
+	}
+
 	if !cf.Eval(rec, now) {
-		return true, nil
+		return outcomeFilteredOut, nil
 	}
 	switch output {
 	case "jsonl":
@@ -246,7 +335,7 @@ func processLine(out io.Writer, cf *eval.CompiledFilter, now time.Time, line []b
 	default: // "raw"
 		err = render.Raw(out, line)
 	}
-	return true, err
+	return outcomeMatched, err
 }
 
 // decodeLine dispatches to the right per-format decoder. FormatPlain can

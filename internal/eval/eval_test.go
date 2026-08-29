@@ -264,9 +264,11 @@ func TestCoercionWiring_LevelOrdinalUnknownTokenFallsBackToStringCompare(t *test
 func TestCoercionWiring_TimestampDuration(t *testing.T) {
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	rec := NewRecord()
-	// Phase 6 will populate this via the real ts-detection ladder; for now
-	// exercise the wiring directly with a manually-set Timestamp value.
-	rec.Set("ts", Timestamp(now.Add(-30*time.Minute)))
+	// "ts" is a virtual path resolving Record.Time/HasTime (commit 22),
+	// not a literal raw field — set those directly, matching how the real
+	// pipeline populates them via eval.ResolveRecordTimestamp.
+	rec.Time = now.Add(-30 * time.Minute)
+	rec.HasTime = true
 
 	if !mustEval(t, `ts >= -1h`, rec, now) {
 		t.Fatal(`ts (now-30m) >= -1h (now-1h) should be true`)

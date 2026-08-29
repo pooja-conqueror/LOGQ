@@ -115,7 +115,21 @@ func (r *Record) Keys() []string { return r.keys }
 // into a value that isn't an object/array — resolves to Missing rather
 // than an error, per M-1/M-2: path resolution never fails, it only ever
 // returns Missing.
+//
+// The single-segment path "ts" is virtual (§6.1): it always means the
+// record's RESOLVED timestamp, populated by ResolveRecordTimestamp's
+// candidate-priority ladder — never a literal raw field that merely
+// happens to be named "ts". That's the whole point of the candidate-name
+// system: `ts >= -1h` behaves identically whether the source JSON's real
+// field was called "ts", "timestamp", or "@timestamp".
 func (r *Record) Resolve(path *query.PathRef) Value {
+	if len(path.Segs) == 1 && !path.Segs[0].IsIndex && path.Segs[0].Ident == "ts" {
+		if r.HasTime {
+			return Timestamp(r.Time)
+		}
+		return Missing
+	}
+
 	cur := Object(r)
 	for _, seg := range path.Segs {
 		if seg.IsIndex {
