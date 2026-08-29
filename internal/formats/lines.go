@@ -55,6 +55,11 @@ func NewLineReader(r io.Reader, maxLine int) *LineReader {
 // together with err == io.EOF in the same call — callers should still use
 // that line before stopping. A pure io.EOF with no line (line == nil)
 // means the stream is fully exhausted.
+//
+// The returned slice is always freshly allocated (accumulateOneLine builds
+// it via append onto a nil slice, never aliasing bufio.Reader's own
+// internal buffer) — safe to retain across calls without a defensive
+// copy, e.g. to buffer several lines at once for format auto-detection.
 func (lr *LineReader) ReadLine() ([]byte, error) {
 	for {
 		line, err := lr.readRawLine()
