@@ -12,8 +12,15 @@ import (
 // (very large, but not infinite) goroutine stack.
 const maxParenDepth = 100
 
-// ParseError is a positioned E-PARSE. Suggest is populated by the
-// Levenshtein suggester (commit 7) and is empty until then.
+// topLevelConnectors and existsCandidates are the current, honest set of
+// keywords a "did you mean" suggestion can be offered against. They grow as
+// more grammar lands (e.g. stage keywords in Phase 7/8) — never claim a
+// suggestion against a keyword the parser doesn't actually accept yet.
+var topLevelConnectors = []string{"and", "or"}
+var existsCandidates = []string{"exists"}
+
+// ParseError is a positioned E-PARSE, optionally carrying a Levenshtein
+// "did you mean" suggestion (see Suggest in suggest.go).
 type ParseError struct {
 	Pos     lex.Pos
 	Msg     string
@@ -56,6 +63,16 @@ func (p *parser) errf(pos lex.Pos, format string, args ...any) error {
 	return &ParseError{Pos: pos, Msg: fmt.Sprintf(format, args...)}
 }
 
+// errWithSuggest is errf plus a "did you mean" lookup against candidates,
+// for the specific unrecognized-identifier text got.
+func (p *parser) errWithSuggest(pos lex.Pos, got string, candidates []string, format string, args ...any) error {
+	return &ParseError{
+		Pos:     pos,
+		Msg:     fmt.Sprintf(format, args...),
+		Suggest: Suggest(got, candidates),
+	}
+}
+
 // ParseQuery parses a full query: an optional FilterExpr followed by
 // pipeline stages. Stage grammar (StatsStage/FieldsStage/SortStage/
 // LimitStage) isn't implemented until Phase 7 (commit 23) — a "|" is
@@ -81,6 +98,10 @@ func ParseQuery(src string) (*Query, error) {
 		return nil, p.illegalErr()
 	}
 	if p.cur.Kind != lex.EOF {
+		if p.cur.Kind == lex.Ident {
+			return nil, p.errWithSuggest(p.cur.Pos, p.cur.Text, topLevelConnectors,
+				"unexpected trailing input %q", p.cur.Text)
+		}
 		return nil, p.errf(p.cur.Pos, "unexpected trailing input %q", p.cur.Text)
 	}
 	return q, nil
@@ -99,6 +120,10 @@ func ParseFilterExpr(src string) (Expr, error) {
 		return nil, p.illegalErr()
 	}
 	if p.cur.Kind != lex.EOF {
+		if p.cur.Kind == lex.Ident {
+			return nil, p.errWithSuggest(p.cur.Pos, p.cur.Text, topLevelConnectors,
+				"unexpected trailing input %q", p.cur.Text)
+		}
 		return nil, p.errf(p.cur.Pos, "unexpected trailing input %q", p.cur.Text)
 	}
 	return expr, nil
@@ -256,6 +281,14 @@ func (p *parser) parseComparisonOrTest() (Expr, error) {
 		return &In{Path: pathRef, Set: set}, nil
 
 	default:
+		// A single bare-identifier PathRef here (nothing else could follow
+		// it) is the shape a typo'd keyword takes — e.g. "exsits(x)" lexes
+		// as a plain path segment "exsits" followed by "(", which is not a
+		// valid path continuation, landing right here.
+		if path, ok := operand.(*PathRef); ok && len(path.Segs) == 1 && !path.Segs[0].IsIndex {
+			return nil, p.errWithSuggest(p.cur.Pos, path.Segs[0].Ident, existsCandidates,
+				"dangling operand; expected a comparison, '~', '!~', or 'in'")
+		}
 		return nil, p.errf(p.cur.Pos, "dangling operand; expected a comparison, '~', '!~', or 'in'")
 	}
 }
