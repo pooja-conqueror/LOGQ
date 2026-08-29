@@ -11,9 +11,9 @@ func TestEditDistance(t *testing.T) {
 		{"a", "", 1},
 		{"", "a", 1},
 		{"count", "count", 0},
-		{"cont", "count", 1},   // one deletion (missing 'u')
-		{"coutn", "count", 2},  // transposition = 2 single-char edits
-		{"levle", "level", 2},  // transposition = 2 single-char edits
+		{"cont", "count", 1},     // one deletion (missing 'u')
+		{"coutn", "count", 2},    // transposition = 2 single-char edits
+		{"levle", "level", 2},    // transposition = 2 single-char edits
 		{"kitten", "sitting", 3}, // the textbook example
 		{"exsits", "exists", 2},
 	}
