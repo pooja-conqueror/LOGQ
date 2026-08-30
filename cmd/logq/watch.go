@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 	"github.com/pooja-conqueror/LOGQ/internal/formats"
 	"github.com/pooja-conqueror/LOGQ/internal/pipeline"
+	"github.com/pooja-conqueror/LOGQ/internal/render"
+	"github.com/pooja-conqueror/LOGQ/internal/summarize"
 	"github.com/pooja-conqueror/LOGQ/internal/watch"
 )
 
@@ -139,7 +142,14 @@ func detectWatchFormat(path, forcedFormat string, maxLine int) (formats.Format, 
 // frozen now) — this is what makes a relative bound like `ts >= -1h` or
 // `--since -1h` behave as an actual rolling window in watch mode, rather
 // than freezing to whatever "now" was when the session started.
-func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, statsStage *pipeline.Stats, stagesPresent bool, files []string, forcedFormat, output string, loc *time.Location, sinceRaw, untilRaw string, interval time.Duration, maxDepth, maxLine int, stderr io.Writer) int {
+func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, statsStage *pipeline.Stats, stagesPresent bool, files []string, forcedFormat, output string, loc *time.Location, sinceRaw, untilRaw string, interval time.Duration, maxDepth, maxLine int, onError string, useColor bool, stderr io.Writer) int {
+	// Watch mode doesn't print a periodic counter summary (its own
+	// SNAPSHOT/rotation stderr messages already serve that role, and a
+	// session with no natural end has no natural "end of run" moment to
+	// print one at) — counters still accumulates so --on-error's
+	// malformed/dup-key/ts-unparsed bookkeeping behaves identically to
+	// batch mode, just without anywhere to report it yet.
+	var counters summarize.Counters
 	watched := make([]*watchedFile, len(files))
 	for i, path := range files {
 		format, err := detectWatchFormat(path, forcedFormat, maxLine)
@@ -160,7 +170,7 @@ func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer,
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintln(stderr, "logq: watch stopped (interrupted)")
+			fmt.Fprintf(stderr, "logq: %s\n", render.Yellow(useColor, "watch stopped (interrupted)"))
 			return exitInterrupted
 		case <-ticker.C:
 			now := time.Now()
@@ -196,15 +206,20 @@ func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer,
 					if len(line) == 0 {
 						continue
 					}
-					_, _, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, w.format, loc, sinceBound, untilBound, output, maxDepth)
+					_, _, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, w.format, loc, sinceBound, untilBound, output, maxDepth, onError, &counters)
 					if werr != nil {
+						if errors.Is(werr, errOnErrorStop) {
+							fmt.Fprintf(stderr, "logq: %v\n", werr)
+							return exitDataStrict
+						}
 						return writeExitCode(stderr, werr)
 					}
 				}
 			}
 
 			if statsStage != nil {
-				fmt.Fprintf(stderr, "logq: SNAPSHOT (poll at %s)\n", now.Format(time.RFC3339))
+				snapshotMsg := fmt.Sprintf("SNAPSHOT (poll at %s)", now.Format(time.RFC3339))
+				fmt.Fprintf(stderr, "logq: %s\n", render.Cyan(useColor, snapshotMsg))
 				for _, rec := range statsStage.Snapshot() {
 					if werr := renderRecord(out, buffered, rec, nil, output, stagesPresent); werr != nil {
 						return writeExitCode(stderr, werr)

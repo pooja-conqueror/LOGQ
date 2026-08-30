@@ -109,18 +109,25 @@ func ResolveTimestamp(v Value, loc *time.Location) (time.Time, bool) {
 // ResolveRecordTimestamp implements the full field-priority + parse-ladder
 // resolution (§6.1): each candidate name in TimestampFieldNames is tried
 // in order, and the first one whose value actually resolves wins — not
-// just the first one present. fieldName reports which candidate matched,
-// for the ts_unparsed{name,...} counter Phase 10 will attach to a failed
-// resolution.
-func ResolveRecordTimestamp(rec *Record, loc *time.Location) (t time.Time, fieldName string, ok bool) {
+// just the first one present. fieldName reports which candidate matched.
+//
+// attempted distinguishes two very different "ok=false" cases for the
+// caller's ts_unparsed counter (§12.3: "ts unparsed | count (time fields
+// aren't errors)") — attempted=false means no candidate field was even
+// present at all (the ordinary, unremarkable case for most log lines,
+// not worth counting as anything); attempted=true means at least one
+// candidate WAS present but every one of them failed to parse as a
+// timestamp, which is the case §12.3 actually means by "unparsed."
+func ResolveRecordTimestamp(rec *Record, loc *time.Location) (t time.Time, fieldName string, ok bool, attempted bool) {
 	for _, name := range TimestampFieldNames {
 		v := rec.Get(name)
 		if v.Kind == KindMissing {
 			continue
 		}
+		attempted = true
 		if parsed, resolved := ResolveTimestamp(v, loc); resolved {
-			return parsed, name, true
+			return parsed, name, true, true
 		}
 	}
-	return time.Time{}, "", false
+	return time.Time{}, "", false, attempted
 }

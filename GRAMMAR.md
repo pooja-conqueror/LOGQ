@@ -473,20 +473,25 @@ flags, version):
 
 `E-PARSE` and `E-TYPE` are real, literal prefixes printed by every parse/
 compile error today (`ParseError`/`CompileError`'s own `Error()`
-methods, e.g. `1:7: E-PARSE: ...`). `E-DATA`/`E-IO`/`E-USAGE` are the
-spec's conceptual categories for the remaining failure classes below —
-today's CLI already maps each to the right exit code, but doesn't yet
-print a matching literal prefix in the message text (Phase 10's error-
-model work); listed here for the exit-code mapping, not as a claim
-they're printed verbatim yet.
+methods, e.g. `1:7: E-PARSE: ...`) — these carry a real query-text
+position, which is what the full `<file>:<line>:<col>: <CODE>: <message>`
+taxonomy format is shaped around. `E-DATA`/`E-IO`/`E-USE` (the spec's own
+code name — not "E-USAGE") cover CLI/runtime failure classes that don't
+have a query-text position to report in the first place (a bad flag
+value, an unreadable file, an aborted run under `--on-error stop`); the
+CLI already maps every one of them to the correct exit code (1/3/4
+respectively) and prints a clear `logq: ...` message, just not yet with
+this literal short-code prefix on that message text — listed here for
+the exit-code mapping and taxonomy completeness, not as a claim the
+three-letter code itself appears verbatim in today's output.
 
 | Code | Meaning |
 |---|---|
 | `E-PARSE` | Lexical or grammatical failure — malformed query syntax (prefix printed) |
 | `E-TYPE` | Semantic/compile-time failure on an otherwise well-formed query — S-1, S-4, S-5, S-6, S-8, an invalid regex pattern (prefix printed) |
-| `E-DATA` | A data-level failure during a run (e.g. mid-stream gzip corruption under `--on-error stop`) |
+| `E-DATA` | A data-level failure during a run — a malformed or oversized line under `--on-error stop` (§12.3), or mid-stream gzip corruption |
 | `E-IO` | A file/stream open or read/write failure |
-| `E-USAGE` | Invalid CLI invocation — bad flag value, missing query argument |
+| `E-USE` | Invalid CLI invocation — bad flag value, missing query argument |
 
 | Exit code | Meaning |
 |---|---|
@@ -511,3 +516,63 @@ they're printed verbatim yet.
 
 Every limit above rejects an out-of-range flag value itself as a usage
 error (exit 1), before any I/O — consistent with `-f`/`-o` validation.
+
+## 20. `--on-error` and the run-wide counter summary (§12.3)
+
+`--on-error skip|warn|stop` (default `warn`) governs exactly two event
+classes: a malformed line (decode failure) and an oversized line
+(exceeds `--max-line`). Every other counter below is always just
+counted, regardless of `--on-error`'s mode — the mode only changes
+whether/how malformed and oversized lines specifically get treated:
+
+- `skip`: counted internally, but the end-of-run summary line is
+  suppressed entirely.
+- `warn` (default): counted, and the summary line prints — the "count,
+  continue" behavior §12.3 calls the default.
+- `stop`: aborts on the very FIRST malformed or oversized line, exit 3.
+  The triggering line's own decode error is printed (its "first offender
+  printed" — see §18's `E-DATA` row). Everything matched *before* that
+  point has already been emitted; nothing after it is read at all.
+
+An unparseable `ts` candidate is **never** fatal, under any
+`--on-error` mode — §12.3's own "time fields aren't errors."
+
+The run-wide counters (`internal/summarize.Counters`), each folded into
+one stderr line at the end of a batch-mode run:
+
+| Counter | Meaning |
+|---|---|
+| `malformed` | decode failure (bad JSON, unterminated logfmt quote, nesting past `--max-depth`, ...) |
+| `oversized` | a line beyond `--max-line`, skipped whole |
+| `dup key(s)` | jsonl fields repeated on one line (last wins) |
+| `dropped by --since/--until` | D-1: dropped by an explicit time-window bound |
+| `ts unparsed` | a timestamp candidate field was present but failed to parse (§12.3) |
+| `groups overflowed to (other)` | stats records collapsed into `(other)` past `--max-groups` (§8.3) — summed across all `-j` shards when parallel |
+
+Watch mode accumulates the same counters internally (so `--on-error`'s
+malformed/oversized handling behaves identically there) but doesn't
+print the summary line — its own `SNAPSHOT`/rotation stderr messages
+already serve that "what's happening" role, and a session with no
+natural end has no natural "end of run" moment to print one at.
+
+Not yet wired: the finer-grained `skipped_nonnumeric{fn,field}`
+per-aggregate-function counters §8.4 also mentions — would need
+threading through every aggregator wrapper in
+`internal/pipeline/stats.go`; a real, separable piece of work, not
+half-built silently.
+
+## 21. Color (`-C`/`--no-color`, `NO_COLOR`)
+
+Three ANSI SGR colors, applied only to stderr diagnostic *messages*
+(never stdout's data output, on any `-o` format): red for the counter
+summary when `malformed > 0`, yellow for `PARTIAL`/watch-stopped,
+cyan for watch mode's `SNAPSHOT` marker. Resolved once per run
+(`render.ShouldColor`), in this precedence order:
+
+1. `-C`/`--no-color` — always wins outright.
+2. [`NO_COLOR`](https://no-color.org) — presence disables color, any
+   value at all, including empty; truthiness is never checked.
+3. Otherwise, color is used only when stderr is an actual terminal
+   (`os.ModeCharDevice` on the underlying `*os.File` — stdlib-only, no
+   isatty binding). Redirected/piped stderr is never colored, regardless
+   of the two flags above.

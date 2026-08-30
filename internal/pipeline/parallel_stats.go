@@ -139,6 +139,19 @@ func (ps *ParallelStats) Flush(emit func(*eval.Record)) {
 	}
 }
 
+// OverflowedGroups sums every shard's own cardinality-guard overflow
+// count (§8.3) — safe to call any time after the records that would
+// affect it have all been Processed (Flush clears each shard's group
+// map, but never its overflow counter, so calling this before or after
+// Flush gives the same correct final answer either way).
+func (ps *ParallelStats) OverflowedGroups() int64 {
+	var total int64
+	for _, s := range ps.shards {
+		total += s.OverflowedGroups()
+	}
+	return total
+}
+
 // shardIndex maps key to a worker index via a plain (unsalted) FNV-1a
 // hash mod n — this is pure load-balancing, not a security boundary the
 // way count_distinct's hash-flooding defense is (internal/agg/distinct.go):

@@ -4,6 +4,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,7 +24,17 @@ import (
 	"github.com/pooja-conqueror/LOGQ/internal/pipeline"
 	"github.com/pooja-conqueror/LOGQ/internal/query"
 	"github.com/pooja-conqueror/LOGQ/internal/render"
+	"github.com/pooja-conqueror/LOGQ/internal/summarize"
 )
+
+// errOnErrorStop marks a fatal abort triggered by --on-error stop
+// (§12.3). Joined (via errors.Join) with the specific line-level error
+// that triggered it, so the caller can both errors.Is-check for this
+// marker — to map it to exit 3, not the generic exit-4 write/read-
+// failure path writeExitCode otherwise assumes — and still get the full
+// formatted detail in err.Error(), which errors.Join's own Error()
+// concatenates from both joined errors.
+var errOnErrorStop = errors.New("aborted: --on-error stop")
 
 const version = "0.1.0"
 
@@ -112,6 +123,17 @@ Flags:
                          byte-identical-output determinism guarantee
                          (§15) is explicitly scoped OUT of watch mode by
                          design (see README).
+      --on-error MODE     malformed/oversized line handling (default warn):
+                         skip = count only, no end-of-run summary line;
+                         warn = count and print the summary line (the
+                         default); stop = abort on the FIRST malformed or
+                         oversized line, exit 3. A ts-unparsed candidate
+                         field is never fatal under any mode — "time
+                         fields aren't errors."
+  -C, --no-color         disable ANSI color on stderr diagnostics (also
+                         honors the NO_COLOR env var — any value, even
+                         empty, disables color; color is never used at
+                         all unless stderr is an actual terminal).
   -h, --help             show this help and exit
       --version          show version and exit
 
@@ -185,6 +207,9 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	watchOpt := &watchFlag{}
 	fs.Var(watchOpt, "w", "watch mode: poll for new content (optional =SECONDS interval)")
 	fs.Var(watchOpt, "watch", "watch mode: poll for new content (optional =SECONDS interval)")
+	onError := fs.String("on-error", "warn", "malformed/oversized line handling: skip|warn|stop")
+	noColor := fs.Bool("C", false, "disable ANSI color on stderr diagnostics")
+	fs.BoolVar(noColor, "no-color", false, "disable ANSI color on stderr diagnostics")
 	help := fs.Bool("h", false, "show help")
 	fs.BoolVar(help, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -220,6 +245,12 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	case "raw", "jsonl", "table", "csv":
 	default:
 		fmt.Fprintf(stderr, "logq: --output %q not recognized (want raw|jsonl|table|csv)\n", *output)
+		return exitUsage
+	}
+	switch *onError {
+	case "skip", "warn", "stop":
+	default:
+		fmt.Fprintf(stderr, "logq: --on-error %q not recognized (want skip|warn|stop)\n", *onError)
 		return exitUsage
 	}
 
@@ -268,6 +299,7 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		fmt.Fprintf(stderr, "logq: invalid --tz %q: %v\n", *tz, err)
 		return exitUsage
 	}
+	useColor := render.ShouldColor(stderr, *noColor)
 
 	// Frozen once, here, before any record is read — this is what
 	// batch-mode determinism (§15) and the timestamp±duration coercion
@@ -343,7 +375,14 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 
 	if watchOpt.enabled {
-		return runWatch(ctx, out, buffered, cf, pl, statsStage, stagesPresent, files, *format, *output, loc, *since, *until, watchOpt.interval, *maxDepth, *maxLine, stderr)
+		// forceSequentialStats (watchOpt.enabled, passed into
+		// buildPipeline above) guarantees statsStage is a *pipeline.Stats
+		// whenever the query has a stats stage at all — nil otherwise.
+		var watchStats *pipeline.Stats
+		if statsStage != nil {
+			watchStats = statsStage.(*pipeline.Stats)
+		}
+		return runWatch(ctx, out, buffered, cf, pl, watchStats, stagesPresent, files, *format, *output, loc, *since, *until, watchOpt.interval, *maxDepth, *maxLine, *onError, useColor, stderr)
 	}
 
 	sources, closeAll, err := openSources(files, stdin)
@@ -358,13 +397,14 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// limit N`) count correctly across multiple files, not per-file, and
 	// what lets a satisfied limit stop reading LATER files entirely, not
 	// just the rest of the current one.
-	var totalLines, malformed, droppedByWindow int
+	var counters summarize.Counters
 	for _, src := range sources {
-		n, m, d, done, srcErr := processSource(ctx, out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound, *maxDepth, *maxLine)
-		totalLines += n
-		malformed += m
-		droppedByWindow += d
+		done, srcErr := processSource(ctx, out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound, *maxDepth, *maxLine, *onError, &counters)
 		if srcErr != nil {
+			if errors.Is(srcErr, errOnErrorStop) {
+				fmt.Fprintf(stderr, "logq: %v\n", srcErr)
+				return exitDataStrict
+			}
 			return writeExitCode(stderr, srcErr)
 		}
 		if done {
@@ -400,6 +440,15 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return writeExitCode(stderr, err)
 	}
 
+	// §8.3's cardinality-guard counter is only knowable once every record
+	// has been Processed — read here, after the loop above and Flush,
+	// from whichever concrete stats stage buildPipeline actually built
+	// (both *pipeline.Stats and *pipeline.ParallelStats implement this;
+	// nil (no stats stage at all) leaves the counter at its zero value).
+	if oc, ok := statsStage.(interface{ OverflowedGroups() int64 }); ok {
+		counters.GroupsOverflowed = oc.OverflowedGroups()
+	}
+
 	// §14: a signal-triggered stop is reported honestly as PARTIAL, not
 	// silently folded into an ordinary exit 0 — checked here (after
 	// everything possible has already been flushed) rather than
@@ -408,14 +457,22 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// anywhere" directly.
 	interrupted := ctx.Err() != nil
 	if interrupted {
-		fmt.Fprintf(stderr, "logq: PARTIAL (interrupted at %d lines) — flushed partial results\n", totalLines)
+		msg := fmt.Sprintf("PARTIAL (interrupted at %d lines) — flushed partial results", counters.LinesRead)
+		fmt.Fprintf(stderr, "logq: %s\n", render.Yellow(useColor, msg))
 	}
-	if malformed > 0 || droppedByWindow > 0 {
-		// A minimal placeholder for Phase 10's full per-field counter
-		// summary (internal/summarize) — a handful of counts only, but
-		// still honest: nothing is ever silently dropped without a trace.
-		fmt.Fprintf(stderr, "logq: %d line(s) read, %d malformed, %d dropped by --since/--until\n",
-			totalLines, malformed, droppedByWindow)
+	// --on-error skip suppresses this summary line entirely — the whole
+	// point of "skip" over "warn" (§12.3's own "count, continue" default
+	// still counts internally either way, this only controls whether
+	// that gets reported).
+	if *onError != "skip" && counters.Noteworthy() {
+		// Red specifically when there's a real decode failure to flag —
+		// dup keys/ts-unparsed/window-drops/overflow alone are routine,
+		// not alarming, so the summary line stays uncolored for those.
+		text := counters.String()
+		if counters.Malformed > 0 {
+			text = render.Red(useColor, text)
+		}
+		fmt.Fprintf(stderr, "logq: %s\n", text)
 	}
 	if interrupted {
 		return exitInterrupted
@@ -473,13 +530,19 @@ type bufferedRenderer interface {
 // *Stats path — no parallel overhead unless actually asked for).
 // forceSequentialStats (set for -w) always uses NewStatsWithLimits
 // directly instead, ignoring workers entirely — see runCtx's own comment
-// on why watch mode can't use ParallelStats. statsStage is non-nil only
-// when a stats stage exists AND forceSequentialStats was set — it's
-// watch mode's own handle for periodic Snapshot() calls; batch mode has
-// no use for it (nil), since Pipeline.Flush already drives every stage's
-// Flush generically without needing a concrete reference to any one of
-// them.
-func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64, workers int, forceSequentialStats bool) (pl *pipeline.Pipeline, statsStage *pipeline.Stats, err error) {
+// on why watch mode can't use ParallelStats.
+//
+// statsStage is the raw built stats stage (either a *pipeline.Stats or a
+// *pipeline.ParallelStats), or nil if the query has no stats stage at
+// all — callers type-assert it for whichever of two unrelated needs
+// applies: watch mode wants Snapshot() (only *pipeline.Stats has it,
+// which forceSequentialStats guarantees whenever a stats stage exists
+// under -w); the end-of-run summary wants OverflowedGroups() int64
+// (both concrete types implement it). Returned as the general
+// pipeline.Stage interface rather than as two separate typed return
+// values so batch mode isn't forced to know or care which concrete type
+// it got.
+func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64, workers int, forceSequentialStats bool) (pl *pipeline.Pipeline, statsStage pipeline.Stage, err error) {
 	execStages := make([]pipeline.Stage, 0, len(stages))
 	for _, st := range stages {
 		switch s := st.(type) {
@@ -507,6 +570,7 @@ func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSampl
 			if serr != nil {
 				return nil, nil, serr
 			}
+			statsStage = ss
 			execStages = append(execStages, ss)
 		default:
 			return nil, nil, fmt.Errorf("internal error: unrecognized stage type %T", st)
@@ -569,21 +633,29 @@ func renderRecord(out io.Writer, buffered bufferedRenderer, rec *eval.Record, li
 // processSource fully processes one source: transparent gzip unwrap, line
 // splitting, format detection (or the forced --format), timestamp
 // resolution, --since/--until filtering, query filtering, and rendering.
-// It returns per-source counts — detection and its "auto" sampling are
-// per-source (§9.2: "Detection cached per file"), never shared across
-// multiple files in one run. A non-nil err is a fatal read/write failure;
-// the caller stops the whole run on it (exit 4). maxDepth/maxLine are
-// --max-depth/--max-line's values. ctx being Done (§14: first SIGINT/
-// SIGTERM) is treated exactly like the pipeline's own "done" signal —
-// stop reading new lines, return with done=true so the caller stops
-// opening any further sources too, but nothing already decoded is
-// discarded.
-func processSource(ctx context.Context, out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time, maxDepth, maxLine int) (linesRead, malformed, droppedByWindow int, done bool, err error) {
+// Every non-fatal event increments counters (a run-wide accumulator the
+// caller owns — this lets a multi-file run report one combined summary,
+// not one per file). A non-nil err is a fatal failure — a genuine read/
+// write error (caller maps to exit 4), or errOnErrorStop joined with
+// context (caller maps to exit 3, §12.3) when --on-error stop caught a
+// malformed or oversized line. maxDepth/maxLine are --max-depth/
+// --max-line's values. ctx being Done (§14: first SIGINT/SIGTERM) is
+// treated exactly like the pipeline's own "done" signal — stop reading
+// new lines, return with done=true so the caller stops opening any
+// further sources too, but nothing already decoded is discarded.
+func processSource(ctx context.Context, out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time, maxDepth, maxLine int, onError string, counters *summarize.Counters) (done bool, err error) {
 	gzr, err := formats.MaybeGunzip(src)
 	if err != nil {
-		return 0, 0, 0, false, err
+		return false, err
 	}
 	lr := formats.NewLineReader(gzr, maxLine)
+	// EmptyLines/OversizedLines are cumulative totals on lr itself — added
+	// to the run-wide counters exactly once, however this function
+	// returns (early abort, error, or normal completion).
+	defer func() {
+		counters.EmptyLines += int64(lr.EmptyLines)
+		counters.OversizedLines += int64(lr.OversizedLines)
+	}()
 
 	var srcFormat formats.Format
 	var sample [][]byte
@@ -597,9 +669,17 @@ func processSource(ctx context.Context, out io.Writer, buffered bufferedRenderer
 	default: // "auto"
 		detected, s, detErr := formats.DetectFromReader(lr)
 		if detErr != nil {
-			return 0, 0, 0, false, detErr
+			return false, detErr
 		}
 		srcFormat, sample = detected, s
+	}
+	// Detection itself already reads (and, via LineReader, can already
+	// skip) up to 64 lines before processSource's own loop below ever
+	// runs — checked here too, not just per-ReadLine further down, so
+	// --on-error stop reacts to an oversized line seen during detection
+	// just as promptly as one seen afterward.
+	if onError == "stop" && lr.OversizedLines > 0 {
+		return false, errors.Join(errOnErrorStop, fmt.Errorf("oversized line (exceeds --max-line %d bytes) encountered during format detection", maxLine))
 	}
 
 	// process reports stop=true once the shared pipeline has signaled it
@@ -607,18 +687,9 @@ func processSource(ctx context.Context, out io.Writer, buffered bufferedRenderer
 	// caller then stops reading this source, and run() stops opening any
 	// further ones too.
 	process := func(line []byte) (stop bool, err error) {
-		linesRead++
-		outcome, pipelineDone, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, srcFormat, loc, since, until, output, maxDepth)
-		if werr != nil {
-			return false, werr
-		}
-		switch outcome {
-		case outcomeMalformed:
-			malformed++
-		case outcomeDroppedByWindow:
-			droppedByWindow++
-		}
-		return pipelineDone, nil
+		counters.LinesRead++
+		_, pipelineDone, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, srcFormat, loc, since, until, output, maxDepth, onError, counters)
+		return pipelineDone, werr
 	}
 
 	// The sample lines were already consumed from lr during auto-detection
@@ -630,43 +701,48 @@ func processSource(ctx context.Context, out io.Writer, buffered bufferedRenderer
 	// unconditionally first.
 	for _, line := range sample {
 		if ctx.Err() != nil {
-			return linesRead, malformed, droppedByWindow, true, nil
+			return true, nil
 		}
 		stop, werr := process(line)
 		if werr != nil {
-			return linesRead, malformed, droppedByWindow, false, werr
+			return false, werr
 		}
 		if stop {
-			return linesRead, malformed, droppedByWindow, true, nil
+			return true, nil
 		}
 	}
 	for {
 		if ctx.Err() != nil {
-			return linesRead, malformed, droppedByWindow, true, nil
+			return true, nil
 		}
+		beforeOversized := lr.OversizedLines
 		line, lerr := lr.ReadLine()
+		if onError == "stop" && lr.OversizedLines > beforeOversized {
+			return false, errors.Join(errOnErrorStop, fmt.Errorf("oversized line (exceeds --max-line %d bytes)", maxLine))
+		}
 		if line != nil {
 			stop, werr := process(line)
 			if werr != nil {
-				return linesRead, malformed, droppedByWindow, false, werr
+				return false, werr
 			}
 			if stop {
-				return linesRead, malformed, droppedByWindow, true, nil
+				return true, nil
 			}
 		}
 		if lerr != nil {
 			if lerr != io.EOF {
-				return linesRead, malformed, droppedByWindow, false, lerr
+				return false, lerr
 			}
 			break
 		}
 	}
 
-	return linesRead, malformed, droppedByWindow, false, nil
+	return false, nil
 }
 
-// lineOutcome distinguishes why a line didn't produce output, for the
-// caller's counters.
+// lineOutcome distinguishes why a line didn't produce output — used
+// internally by processLine's own control flow (its callers only need
+// done/err, so it's no longer part of processLine's return signature).
 type lineOutcome int
 
 const (
@@ -679,19 +755,41 @@ const (
 // processLine decodes one line under the given format, resolves its
 // timestamp, applies --since/--until, evaluates the compiled query
 // filter, runs the record through the pipeline stages, and renders it if
-// everything passes. err is non-nil only for a genuine write failure to
-// out, which the caller treats as fatal. done propagates the pipeline's
-// own done signal (§ Stage: "no more input needs to be read at all") —
-// true once, for instance, limit's count has been reached.
-func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string, maxDepth int) (outcome lineOutcome, done bool, err error) {
-	rec, decErr := decodeLine(line, format, maxDepth)
+// everything passes — incrementing counters for every non-fatal event
+// along the way. err is non-nil for a genuine write failure to out
+// (fatal, caller treats as exit 4), or — under --on-error stop — a
+// malformed line, joined with errOnErrorStop (§12.3: exit 3, "first
+// offender printed"; an oversized line is caught one layer up, in
+// processSource, since LineReader skips those internally before a line
+// ever reaches here at all). done propagates the pipeline's own done
+// signal (§ Stage: "no more input needs to be read at all") — true once,
+// for instance, limit's count has been reached.
+func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string, maxDepth int, onError string, counters *summarize.Counters) (outcome lineOutcome, done bool, err error) {
+	rec, dupKeys, decErr := decodeLine(line, format, maxDepth)
+	counters.DupKeys += int64(dupKeys)
 	if decErr != nil {
+		counters.Malformed++
+		if onError == "stop" {
+			// decErr already reads as a complete, self-describing message
+			// (formats/jsonl.go's own errors are already prefixed
+			// "malformed line: ..."; logfmtx's are similarly self-
+			// contained) — wrapping it again here would just duplicate
+			// that prefix, so it's joined as-is.
+			return outcomeMalformed, false, errors.Join(errOnErrorStop, decErr)
+		}
 		return outcomeMalformed, false, nil
 	}
 
-	if t, _, ok := eval.ResolveRecordTimestamp(rec, loc); ok {
+	if t, _, ok, attempted := eval.ResolveRecordTimestamp(rec, loc); ok {
 		rec.Time = t
 		rec.HasTime = true
+	} else if attempted {
+		// §12.3: a candidate field WAS present but failed to parse — the
+		// actual "ts unparsed" case, distinct from simply having no
+		// candidate field at all (the ordinary, unremarkable case for
+		// most lines, not worth counting). Never fatal, even under
+		// --on-error stop ("time fields aren't errors").
+		counters.TSUnparsed++
 	}
 
 	if since != nil || until != nil {
@@ -699,12 +797,15 @@ func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilt
 		// EXCEPT under an explicit --since/--until bound, where they are
 		// dropped and counted rather than silently passed through.
 		if !rec.HasTime {
+			counters.DroppedByWindow++
 			return outcomeDroppedByWindow, false, nil
 		}
 		if since != nil && rec.Time.Before(*since) {
+			counters.DroppedByWindow++
 			return outcomeDroppedByWindow, false, nil
 		}
 		if until != nil && rec.Time.After(*until) {
+			counters.DroppedByWindow++
 			return outcomeDroppedByWindow, false, nil
 		}
 	}
@@ -724,19 +825,21 @@ func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilt
 
 // decodeLine dispatches to the right per-format decoder. FormatPlain can
 // never fail — there's nothing to parse, only to wrap. maxDepth is
-// --max-depth's value, consulted only for jsonl.
-func decodeLine(line []byte, format formats.Format, maxDepth int) (*eval.Record, error) {
+// --max-depth's value, consulted only for jsonl. dupKeys is always 0 for
+// logfmt/plain — only jsonl's decoder currently tracks it.
+func decodeLine(line []byte, format formats.Format, maxDepth int) (rec *eval.Record, dupKeys int, err error) {
 	switch format {
 	case formats.FormatLogfmt:
-		return logfmtx.DecodeLine(line)
+		r, err := logfmtx.DecodeLine(line)
+		return r, 0, err
 	case formats.FormatPlain:
-		return formats.DecodePlainLine(line), nil
+		return formats.DecodePlainLine(line), 0, nil
 	default: // formats.FormatJSONL
 		res, err := formats.DecodeLine(line, maxDepth)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		return res.Record, nil
+		return res.Record, res.DupKeys, nil
 	}
 }
 

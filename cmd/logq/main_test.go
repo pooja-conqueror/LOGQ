@@ -781,3 +781,140 @@ func TestIsBrokenPipe_RejectsUnrelatedErrors(t *testing.T) {
 		t.Error("isBrokenPipe(unrelated error) = true, want false")
 	}
 }
+
+func TestRun_OnErrorFlagRejectsInvalid(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--on-error", "explode", `exists(x)`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_OnErrorDefaultWarnPrintsSummary(t *testing.T) {
+	// -f jsonl forced: mixed valid/invalid JSON lines would otherwise
+	// fail auto-detection's own all-or-nothing cascade entirely (falling
+	// through to plain text) — not what this test is about.
+	stdin := `{"x":1}` + "\n" + `not json at all` + "\n"
+	code, out, errOut := runCLI(t, []string{"-f", "jsonl", `exists(x)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"x":1}` {
+		t.Fatalf("out = %q, want just the valid line", out)
+	}
+	if !strings.Contains(errOut, "1 malformed") {
+		t.Fatalf("errOut = %q, want it to mention 1 malformed (default is warn)", errOut)
+	}
+}
+
+func TestRun_OnErrorSkipSuppressesSummary(t *testing.T) {
+	stdin := `{"x":1}` + "\n" + `not json at all` + "\n"
+	code, out, errOut := runCLI(t, []string{"-f", "jsonl", "--on-error", "skip", `exists(x)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"x":1}` {
+		t.Fatalf("out = %q, want just the valid line — skip still skips, it just doesn't report", out)
+	}
+	if errOut != "" {
+		t.Fatalf("errOut = %q, want empty — --on-error skip suppresses the summary line entirely", errOut)
+	}
+}
+
+func TestRun_OnErrorStopAbortsOnMalformedLine(t *testing.T) {
+	stdin := `{"x":1}` + "\n" + `not json at all` + "\n" + `{"x":2}` + "\n"
+	code, out, errOut := runCLI(t, []string{"-f", "jsonl", "--on-error", "stop", `exists(x)`}, stdin)
+	if code != exitDataStrict {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitDataStrict, errOut)
+	}
+	if !strings.Contains(out, `"x":1`) {
+		t.Fatalf("out = %q, want the first (valid) line to have already been emitted before the abort", out)
+	}
+	if strings.Contains(out, `"x":2`) {
+		t.Fatalf("out = %q, must not contain the line AFTER the malformed one — stop means stop", out)
+	}
+	if !strings.Contains(errOut, "malformed") {
+		t.Fatalf("errOut = %q, want it to describe the malformed-line offender", errOut)
+	}
+}
+
+func TestRun_OnErrorStopAbortsOnOversizedLine(t *testing.T) {
+	longLine := `{"msg":"` + strings.Repeat("x", 200) + `"}`
+	stdin := `{"x":1}` + "\n" + longLine + "\n"
+	code, _, errOut := runCLI(t, []string{"--on-error", "stop", "--max-line", "50", `exists(x)`}, stdin)
+	if code != exitDataStrict {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitDataStrict, errOut)
+	}
+	if !strings.Contains(errOut, "oversized") {
+		t.Fatalf("errOut = %q, want it to describe the oversized-line offender", errOut)
+	}
+}
+
+func TestRun_OnErrorStopDoesNotAbortOnTSUnparsed(t *testing.T) {
+	// §12.3: "ts unparsed | count (time fields aren't errors)" — never
+	// fatal, not even under --on-error stop.
+	stdin := `{"ts":"not a real timestamp","x":1}` + "\n"
+	code, out, errOut := runCLI(t, []string{"--on-error", "stop", `exists(x)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want %d (stderr: %s) — an unparseable ts must never trigger --on-error stop", code, exitOK, errOut)
+	}
+	if !strings.Contains(out, `"x":1`) {
+		t.Fatalf("out = %q, want the line to still be emitted", out)
+	}
+	if !strings.Contains(errOut, "ts unparsed") {
+		t.Fatalf("errOut = %q, want it to still count the ts-unparsed event", errOut)
+	}
+}
+
+func TestRun_DupKeysCountedInSummary(t *testing.T) {
+	stdin := `{"x":1,"x":2}` + "\n"
+	code, _, errOut := runCLI(t, []string{`exists(x)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(errOut, "1 dup key") {
+		t.Fatalf("errOut = %q, want it to mention 1 dup key", errOut)
+	}
+}
+
+func TestRun_GroupsOverflowedCountedInSummary(t *testing.T) {
+	stdin := `{"service":"a"}` + "\n" + `{"service":"b"}` + "\n" + `{"service":"c"}` + "\n"
+	code, _, errOut := runCLI(t, []string{"--max-groups", "2", `| stats count() by service`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(errOut, "groups overflowed") {
+		t.Fatalf("errOut = %q, want it to mention groups overflowed", errOut)
+	}
+}
+
+func TestRun_GroupsOverflowedCountedWithParallelStats(t *testing.T) {
+	// Confirms ParallelStats.OverflowedGroups (summed across shards) is
+	// actually wired into the summary too, not just the sequential path.
+	var sb strings.Builder
+	for i := range 100 {
+		fmt.Fprintf(&sb, `{"service":"svc%d"}`+"\n", i)
+	}
+	code, _, errOut := runCLI(t, []string{"--max-groups", "5", "-j", "4", `| stats count() by service`}, sb.String())
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(errOut, "groups overflowed") {
+		t.Fatalf("errOut = %q, want it to mention groups overflowed even under -j 4", errOut)
+	}
+}
+
+func TestRun_NoColorNeverLeaksANSIIntoNonTTYOutput(t *testing.T) {
+	// The test harness's stderr is always a bytes.Buffer, never a real
+	// terminal — render.ShouldColor must therefore always be false here
+	// regardless of --no-color/NO_COLOR, and no raw ANSI escape byte
+	// should ever appear in captured stderr. This is the one thing
+	// actually verifiable in an automated, non-interactive test; genuine
+	// on-a-real-terminal coloring is covered directly in
+	// internal/render/color_test.go instead (IsTTY/ShouldColor's own
+	// logic), since no real tty is available to drive through here.
+	stdin := `{"x":1}` + "\n" + `not json at all` + "\n"
+	_, _, errOut := runCLI(t, []string{"-f", "jsonl", `exists(x)`}, stdin)
+	if strings.ContainsRune(errOut, '\x1b') {
+		t.Fatalf("errOut = %q, must never contain a raw ANSI escape when stderr isn't a terminal", errOut)
+	}
+}

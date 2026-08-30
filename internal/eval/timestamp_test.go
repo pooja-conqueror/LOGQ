@@ -168,9 +168,12 @@ func TestResolveRecordTimestamp_PriorityOrder(t *testing.T) {
 	rec.Set("timestamp", Str("2026-08-29T12:00:00Z")) // higher priority
 	rec.Set("time", Str("2026-08-29T06:00:00Z"))      // higher priority still (but below "ts")
 
-	got, name, ok := ResolveRecordTimestamp(rec, nil)
+	got, name, ok, attempted := ResolveRecordTimestamp(rec, nil)
 	if !ok {
 		t.Fatal("resolution failed")
+	}
+	if !attempted {
+		t.Fatal("attempted = false, want true — a candidate field was present and resolved")
 	}
 	if name != "time" {
 		t.Fatalf("resolved field = %q, want %q (highest-priority present field)", name, "time")
@@ -188,9 +191,12 @@ func TestResolveRecordTimestamp_FirstResolvableNotFirstPresent(t *testing.T) {
 	rec.Set("ts", Str("not a real timestamp"))
 	rec.Set("time", Str("2026-08-29T12:00:00Z"))
 
-	got, name, ok := ResolveRecordTimestamp(rec, nil)
+	got, name, ok, attempted := ResolveRecordTimestamp(rec, nil)
 	if !ok {
 		t.Fatal("resolution failed — should have fallen through to 'time'")
+	}
+	if !attempted {
+		t.Fatal("attempted = false, want true")
 	}
 	if name != "time" {
 		t.Fatalf("resolved field = %q, want %q", name, "time")
@@ -204,7 +210,7 @@ func TestResolveRecordTimestamp_FirstResolvableNotFirstPresent(t *testing.T) {
 func TestResolveRecordTimestamp_AtSignField(t *testing.T) {
 	rec := NewRecord()
 	rec.Set("@timestamp", Str("2026-08-29T12:00:00Z"))
-	_, name, ok := ResolveRecordTimestamp(rec, nil)
+	_, name, ok, _ := ResolveRecordTimestamp(rec, nil)
 	if !ok || name != "@timestamp" {
 		t.Fatalf("name=%q ok=%v, want @timestamp resolved", name, ok)
 	}
@@ -213,9 +219,12 @@ func TestResolveRecordTimestamp_AtSignField(t *testing.T) {
 func TestResolveRecordTimestamp_NoCandidatesPresent(t *testing.T) {
 	rec := NewRecord()
 	rec.Set("msg", Str("hello"))
-	_, _, ok := ResolveRecordTimestamp(rec, nil)
+	_, _, ok, attempted := ResolveRecordTimestamp(rec, nil)
 	if ok {
 		t.Fatal("resolution should fail when no candidate field is present at all")
+	}
+	if attempted {
+		t.Fatal("attempted = true, want false — no candidate field was present at all, so ts_unparsed must not count this")
 	}
 }
 
@@ -223,8 +232,11 @@ func TestResolveRecordTimestamp_AllCandidatesUnresolvable(t *testing.T) {
 	rec := NewRecord()
 	rec.Set("ts", Str("garbage"))
 	rec.Set("eventTime", Bool(true)) // wrong kind entirely
-	_, _, ok := ResolveRecordTimestamp(rec, nil)
+	_, _, ok, attempted := ResolveRecordTimestamp(rec, nil)
 	if ok {
 		t.Fatal("resolution should fail when every present candidate is unresolvable")
+	}
+	if !attempted {
+		t.Fatal("attempted = false, want true — candidates WERE present, just unparsable; this is the real ts_unparsed case (§12.3)")
 	}
 }

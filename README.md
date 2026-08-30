@@ -155,6 +155,16 @@ logq -j 4 '| stats count(), avg(duration_ms) by url.path' huge.jsonl
 # at the top of this README for exactly what's exempt in watch mode.
 logq -w 'level == "error"' app.log                  # default 1s poll
 logq -w=5 '| stats count() by service' app.log       # 5s poll, growing SNAPSHOT
+
+# --on-error: skip = silent, warn = default (count + summary line), stop
+# = abort on the first malformed/oversized line, exit 3. -f jsonl forced
+# explicitly here since a mix of valid/corrupted lines would otherwise
+# fail auto-detection's own all-or-nothing cascade entirely (see above).
+logq -f jsonl --on-error stop 'exists(x)' app.jsonl
+
+# -C/--no-color (or NO_COLOR=1): disable stderr's small ANSI palette —
+# never applied to redirected/piped output either way, only a real tty
+logq -C 'level == "error"' app.jsonl
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -277,14 +287,34 @@ full spec:
   fixed via a Windows-specific `syscall.CreateFile` open (stdlib only,
   no dependency) that explicitly requests it; empirically confirmed
   broken beforehand and fixed afterward on this dev machine.
-- **Error/summary model:** malformed lines are skipped and counted with a
-  single stderr line at the end of a run; the full per-field counter
-  breakdown (`--on-error`, coercion-miss counts, etc.) lands in Phase 10.
+- **Error/summary model (`--on-error skip|warn|stop`, default `warn`):**
+  every non-fatal counter (`internal/summarize`) — malformed lines,
+  oversized lines, jsonl duplicate keys, `--since`/`--until` drops,
+  unparseable timestamp candidates, `--max-groups` overflow — is folded
+  into one end-of-run stderr line, red when a real decode failure
+  occurred. `skip` still counts internally but suppresses that line
+  entirely; `warn` (default) prints it; `stop` aborts on the FIRST
+  malformed or oversized line specifically, exit 3 — a ts-unparsed
+  candidate is never fatal under any mode ("time fields aren't errors").
+  Not yet wired: the finer-grained `skipped_nonnumeric{fn,field}`
+  per-aggregate-function counters the spec also mentions — would need
+  threading through every aggregator wrapper in
+  `internal/pipeline/stats.go`, deliberately left for later rather than
+  half-wired now.
 - **Depth/size/query limits:** JSON nesting (default 32, `--max-depth`),
   oversized lines (default 1MB, up to 16MB, `--max-line`), and query text
   length (default 8192 characters, up to 65536, `--max-query`) are all
   configurable now. A line or query exceeding its limit is skipped/
   rejected and counted — never silently truncated.
+- **Color (`-C`/`--no-color`):** stderr diagnostics (the counter summary,
+  `PARTIAL`, watch mode's `SNAPSHOT`/stopped messages) get a small ANSI
+  SGR palette — never stdout's actual data output, on any output format.
+  Auto-detected via a portable, stdlib-only tty check (`os.ModeCharDevice`
+  on the underlying `*os.File`, no isatty binding/dependency needed);
+  honors [`NO_COLOR`](https://no-color.org) (any value, even empty) and
+  `-C`/`--no-color` on top of that. Never active for redirected/piped
+  output regardless of flags — verified color never leaks into non-tty
+  stderr.
 
 Nothing above is hidden or silently degraded — every one of these either
 fails with a clear, explicit "not yet supported" message or is documented
