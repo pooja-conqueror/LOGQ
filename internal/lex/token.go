@@ -89,6 +89,11 @@ var keywords = map[string]Kind{
 	"in":             KwIn,
 }
 
+// IsKeyword reports whether k is one of the reserved keyword kinds
+// (KwAnd..KwIn, a contiguous block above) rather than a punctuation,
+// literal, or structural kind.
+func IsKeyword(k Kind) bool { return k >= KwAnd && k <= KwIn }
+
 // Pos is a token's position: Offset is a byte offset into the source, Line
 // is 1-based, Col is a 1-based rune count within Line (not a byte count).
 type Pos struct {

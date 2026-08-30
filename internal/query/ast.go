@@ -168,6 +168,16 @@ type StatFn struct {
 	Path *PathRef
 }
 
+// String renders k back to its bare source keyword, e.g. "count",
+// "count_distinct", "p95" — exported so internal/pipeline can derive a
+// stats row's output column name from it without duplicating this
+// name table. Deliberately NOT the fuller "count_distinct(url)" call
+// syntax (statFnKey, parser.go, used only for S-6's compile-time
+// duplicate check): a stats output column must be a plain identifier a
+// later `sort <col>` can reference via ordinary Path syntax, which has
+// no grammar for parentheses at all.
+func (k StatFnKind) String() string { return statFnName(k) }
+
 // StatsStage is the terminal aggregation stage (§7/§8): one or more
 // StatFns, an optional "by" grouping path list, and an optional "every"
 // window duration. Every is kept as validated raw text (parsed once here

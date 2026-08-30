@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -520,20 +521,60 @@ func TestRun_RawOutputStillByteVerbatimWithoutStages(t *testing.T) {
 	}
 }
 
-func TestRun_StatsStageClearErrorNotInternalError(t *testing.T) {
-	// StatsStage parses fine as of commit 28, but buildPipeline has no
-	// aggregation engine to run it with yet (later in Phase 8) — must
-	// fail with a clear, specific message, not the generic "internal
-	// error: unrecognized stage type" fallback, which would read as an
-	// alarming bug report for what's actually an honest, expected gap.
-	code, _, errOut := runCLI(t, []string{`| stats count()`}, "")
+func TestRun_StatsStageBasicCountByGroup(t *testing.T) {
+	stdin := `{"service":"a"}` + "\n" +
+		`{"service":"b"}` + "\n" +
+		`{"service":"a"}` + "\n"
+	code, out, errOut := runCLI(t, []string{`| stats count() by service`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	// stats output is always rendered via jsonl serialization (stages
+	// present), one JSON object per line, sorted by group key (§15).
+	wantLines := []string{`{"service":"a","count":2}`, `{"service":"b","count":1}`}
+	gotLines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(gotLines) != len(wantLines) {
+		t.Fatalf("out = %q, want %d lines", out, len(wantLines))
+	}
+	for i, want := range wantLines {
+		if gotLines[i] != want {
+			t.Fatalf("line %d = %q, want %q", i, gotLines[i], want)
+		}
+	}
+}
+
+func TestRun_StatsStageSortLimitTopKOverGroups(t *testing.T) {
+	// §8.5: 'sort <aggcol> desc limit K' after 'stats' bounds the output
+	// to the top K groups by that column — the S-5 relaxation this commit
+	// makes real end to end, through the actual CLI entry point.
+	var sb strings.Builder
+	for _, svc := range []string{"a", "b", "b", "c", "c", "c"} {
+		fmt.Fprintf(&sb, `{"service":%q}`+"\n", svc)
+	}
+	code, out, errOut := runCLI(t, []string{`| stats count() by service | sort count desc limit 2`}, sb.String())
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	wantLines := []string{`{"service":"c","count":3}`, `{"service":"b","count":2}`}
+	gotLines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(gotLines) != len(wantLines) {
+		t.Fatalf("out = %q, want exactly %d lines (bounded by limit 2)", out, len(wantLines))
+	}
+	for i, want := range wantLines {
+		if gotLines[i] != want {
+			t.Fatalf("line %d = %q, want %q", i, gotLines[i], want)
+		}
+	}
+}
+
+func TestRun_StatsStageFieldsCannotFollow(t *testing.T) {
+	// S-5 still rejects 'fields' after 'stats' — only sort/limit are the
+	// explicit exception.
+	code, _, errOut := runCLI(t, []string{`| stats count() | fields x`}, "")
 	if code != exitCompile {
-		t.Fatalf("exit = %d, want %d", code, exitCompile)
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitCompile, errOut)
 	}
-	if strings.Contains(errOut, "internal error") {
-		t.Fatalf("errOut = %q, must not read as an internal error", errOut)
-	}
-	if !strings.Contains(errOut, "not implemented yet") {
-		t.Fatalf("errOut = %q, want a clear not-implemented-yet message", errOut)
+	if !strings.Contains(errOut, "terminal stage") {
+		t.Fatalf("errOut = %q, want it to mention the terminal-stage rule", errOut)
 	}
 }

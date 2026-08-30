@@ -165,7 +165,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
-	pl, err := buildPipeline(q.Stages)
+	pl, err := buildPipeline(q.Stages, loc)
 	if err != nil {
 		// e.g. NewFields' S-8 duplicate-output-column check — still a
 		// compile-time failure, before any I/O.
@@ -278,14 +278,11 @@ type bufferedRenderer interface {
 
 // buildPipeline converts the parsed Stage AST into executable
 // pipeline.Stage values, once, before any I/O — a stage that fails to
-// build (NewFields' S-8 duplicate-column check, or a StatsStage — parses
-// fine as of commit 28, but its actual aggregation engine doesn't exist
-// until later in Phase 8) is a compile-time error, exactly like an
-// invalid query itself. A StatsStage specifically gets its own clear
-// message here rather than falling through to the generic default case,
-// which would otherwise read as an alarming "internal error" for what's
-// actually just an honest, expected, temporary gap.
-func buildPipeline(stages []query.Stage) (*pipeline.Pipeline, error) {
+// build (NewFields' S-8 duplicate-column check) is a compile-time error,
+// exactly like an invalid query itself. loc is the run's resolved --tz
+// location, needed by StatsStage's window-bucket alignment (§8.1) even
+// when no "every" clause is present, for API uniformity.
+func buildPipeline(stages []query.Stage, loc *time.Location) (*pipeline.Pipeline, error) {
 	execStages := make([]pipeline.Stage, 0, len(stages))
 	for _, st := range stages {
 		switch s := st.(type) {
@@ -300,7 +297,11 @@ func buildPipeline(stages []query.Stage) (*pipeline.Pipeline, error) {
 		case *query.LimitStage:
 			execStages = append(execStages, pipeline.NewLimit(s.Limit))
 		case *query.StatsStage:
-			return nil, fmt.Errorf("the 'stats' stage parses but its aggregation engine is not implemented yet")
+			ss, err := pipeline.NewStats(s, loc)
+			if err != nil {
+				return nil, err
+			}
+			execStages = append(execStages, ss)
 		default:
 			return nil, fmt.Errorf("internal error: unrecognized stage type %T", st)
 		}

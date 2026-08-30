@@ -644,12 +644,48 @@ func TestParseQuery_StatsStage_SameFunctionDifferentPathAllowed(t *testing.T) {
 }
 
 func TestParseQuery_StatsStage_MustBeTerminal(t *testing.T) {
-	// S-5: no stage may follow stats.
+	// S-5 (relaxed): stats stays terminal for 'fields' and a second
+	// 'stats' — its own group-key columns are the only paths a following
+	// stage could meaningfully reference, and re-aggregating aggregate
+	// output isn't a thing this grammar supports.
 	if _, err := ParseQuery(`| stats count() | fields x`); err == nil {
 		t.Fatal("'stats ... | fields ...' should be rejected — stats must be terminal (S-5)")
 	}
-	if _, err := ParseQuery(`| stats count() | limit 5`); err == nil {
-		t.Fatal("'stats ... | limit ...' should be rejected — stats must be terminal (S-5)")
+	if _, err := ParseQuery(`| stats count() | stats count()`); err == nil {
+		t.Fatal("'stats ... | stats ...' should be rejected — stats must be terminal (S-5)")
+	}
+	// A 'fields' arriving after a sort/limit that itself followed stats
+	// must still be rejected — the restriction is "statsSeen", not just
+	// "the immediately preceding stage."
+	if _, err := ParseQuery(`| stats count() | limit 5 | fields x`); err == nil {
+		t.Fatal("'stats ... | limit ... | fields ...' should be rejected — S-5 doesn't lapse after an intervening sort/limit")
+	}
+}
+
+func TestParseQuery_StatsStage_SortAndLimitCanFollow(t *testing.T) {
+	// S-5's one explicit exception: sort/limit ARE allowed after stats —
+	// bounded top-K over the aggregate groups it produced (§8.5), reusing
+	// the ordinary SortStage/LimitStage machinery.
+	q, err := ParseQuery(`| stats count() by url | sort count desc limit 5`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	if len(q.Stages) != 2 {
+		t.Fatalf("Stages = %#v, want 2 (stats, sort)", q.Stages)
+	}
+	if _, ok := q.Stages[1].(*SortStage); !ok {
+		t.Fatalf("Stages[1] = %T, want *SortStage", q.Stages[1])
+	}
+
+	q2, err := ParseQuery(`| stats count() by url | limit 5`)
+	if err != nil {
+		t.Fatalf("ParseQuery error = %v", err)
+	}
+	if len(q2.Stages) != 2 {
+		t.Fatalf("Stages = %#v, want 2 (stats, limit)", q2.Stages)
+	}
+	if _, ok := q2.Stages[1].(*LimitStage); !ok {
+		t.Fatalf("Stages[1] = %T, want *LimitStage", q2.Stages[1])
 	}
 }
 

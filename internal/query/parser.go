@@ -98,22 +98,39 @@ func ParseQuery(src string) (*Query, error) {
 		q.Filter = filter
 	}
 
+	statsSeen := false
 	for p.cur.Kind == lex.Pipe {
-		// S-5: stats must be the terminal stage — checked here, before
-		// even attempting to parse whatever comes after this "|", so a
-		// query like `stats count() | fields x` fails with a clear,
-		// precisely-positioned error rather than a confusing one from
-		// deep inside fields parsing.
-		if len(q.Stages) > 0 {
-			if _, ok := q.Stages[len(q.Stages)-1].(*StatsStage); ok {
-				return nil, p.errf(p.cur.Pos, "'stats' must be the terminal stage — no stage may follow it")
-			}
-		}
+		pipePos := p.cur.Pos
 		p.advance()
 		stage, err := p.parseStage()
 		if err != nil {
 			return nil, err
 		}
+
+		// S-5: once 'stats' has appeared, only 'sort'/'limit' may still
+		// follow it — bounded top-K over the aggregate groups it produced
+		// (§8.5: "sort <aggcol> desc limit K after stats"), reusing the
+		// exact same SortStage/LimitStage machinery an ordinary
+		// post-filter record stream uses. 'fields' or a second 'stats'
+		// still can't follow: stats remains the terminal AGGREGATION
+		// stage (its own group-key columns are the only paths a
+		// following sort/limit can meaningfully reference), just not the
+		// terminal stage outright. statsSeen (not just "the immediately
+		// preceding stage") is what's checked, so this also correctly
+		// rejects e.g. `stats ... | sort a desc limit 5 | fields x` — the
+		// restriction doesn't lapse just because a sort/limit stage sits
+		// between stats and the offending one.
+		if statsSeen {
+			switch stage.(type) {
+			case *SortStage, *LimitStage:
+			default:
+				return nil, p.errf(pipePos, "'stats' must be the terminal stage, except for a following 'sort'/'limit' (top-K over its groups) — no other stage may follow it")
+			}
+		}
+		if _, ok := stage.(*StatsStage); ok {
+			statsSeen = true
+		}
+
 		q.Stages = append(q.Stages, stage)
 	}
 
@@ -725,16 +742,29 @@ func (p *parser) parsePath() (*PathRef, error) {
 }
 
 func (p *parser) parsePathSeg() (PathSeg, error) {
-	switch p.cur.Kind {
-	case lex.Ident:
+	switch {
+	case p.cur.Kind == lex.Ident, p.cur.Kind == lex.String:
 		text := p.cur.Text
 		p.advance()
 		return PathSeg{Ident: text}, nil
-	case lex.String:
+	case lex.IsKeyword(p.cur.Kind):
+		// A keyword-shaped bare word (e.g. "count") is still a valid path
+		// segment wherever a path is unambiguously expected. parsePathSeg
+		// is only ever reached (via parsePath) from grammar positions
+		// that have ALREADY committed to "a path comes next" — fields'
+		// targets, sort's target, stats' by-clause and function
+		// arguments, exists(...)'s argument, and path continuations after
+		// "." or "[". The general filter-expression operand dispatch
+		// (parseOperand) gates on lex.Ident/lex.Dot BEFORE ever calling
+		// parsePath, so this can't make a bare `count == 5` filter
+		// ambiguous with any keyword — that dispatch is untouched. This
+		// is what makes a stats output column literally named "count"
+		// (StatCount's own bare column name) usable as an ordinary
+		// `sort count desc` target (§8.5's top-K over aggregate groups).
 		text := p.cur.Text
 		p.advance()
 		return PathSeg{Ident: text}, nil
-	case lex.Illegal:
+	case p.cur.Kind == lex.Illegal:
 		return PathSeg{}, p.illegalErr()
 	default:
 		return PathSeg{}, p.errf(p.cur.Pos, "expected a path segment (identifier or \"quoted\")")
