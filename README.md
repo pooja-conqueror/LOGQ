@@ -14,9 +14,11 @@ as distinct from a JSON `null`, and gives `level` fields ordinal comparisons
 is hand-written against the Go standard library — no parsing, CLI, or
 aggregation package anywhere in the dependency graph.
 
-**Status:** under active development. This README is being filled in
-incrementally, commit by commit, alongside the code — sections below are
-placeholders until the corresponding feature lands.
+**Status:** feature-complete for this Track B submission — every phase in
+the build plan has landed, and this README (along with `STDLIB.md`,
+`GRAMMAR.md`, and `BENCHMARKS.md`) reflects the code as of this commit,
+not an earlier snapshot. "Honest Limits" below still lists the handful of
+deliberate, disclosed scope cuts (nothing hidden, nothing half-wired).
 
 **Determinism scope, stated up front:** batch mode (the default — no
 `-w`/`--watch`) produces byte-identical stdout for identical (input
@@ -34,6 +36,12 @@ byte-for-byte was never the goal; comparing two batch-mode runs is.
 
 - **Track:** B — Parsers & Data Formats
 - **Language:** Go, stdlib only (`go.mod` has no `require` block, ever)
+- **Declared bonus:** Reproducible Build (+5) — `make repro-check` builds
+  twice with identical flags and diffs the SHA-256 hashes; both builds
+  produced the identical hash on this machine (see the Makefile's own
+  comment for the actual value). STDLIB Log and Package Killer land
+  organically from `STDLIB.md`'s real substitutions rather than being
+  separately chased.
 - See `STDLIB.md` for every package this project would normally have pulled
   in, and what it uses from the standard library instead.
 
@@ -67,6 +75,55 @@ logfmt input, `--on-error stop`, `--max-groups` overflow, `--levels`
 overrides, `MISSING`/`Null`/empty-string's three-way distinction, and a
 usage-error exit code — run individually via
 `go test ./tests/golden/ -run TestGolden/<fixture-name>`.
+
+`tests/chaos/` (black-box, same real-subprocess pattern as `tests/golden`)
+and `cmd/logq/chaos_test.go` (in-process, for the one scenario —
+mid-stream interrupt timing — that a real subprocess can't test
+deterministically) push logq under adversarial, real-world-shaped
+conditions: a truncated mid-stream gzip file, hundreds of oversized
+lines interleaved with valid ones, a 5,000-group `-j` determinism check,
+and an interrupt landing at an exact line count mid-volume. `go test
+-fuzz=FuzzParseQuery ./internal/query/` and `go test
+-fuzz=FuzzLogfmtRoundTrip ./internal/logfmtx/` fuzz the parser and the
+logfmt round-trip property natively (`make fuzz` runs both, 30s each).
+`make race` runs the full suite under the race detector — requires a C
+compiler (`CGO_ENABLED=1`), which this project's own dev environment
+didn't have, so that pass is documented as unverified rather than
+falsely claimed. `cmd/logq/soak_test.go`'s
+`TestSoak_MemoryStaysBoundedAcrossCorpusScale` runs automatically on
+every `go test ./...` and asserts heap growth stays flat across a 10x
+input-size increase (`runtime.MemStats.HeapAlloc`, the honest portable
+proxy for RSS in a cgo-free build); `make soak-manual` runs the same
+claim at real scale against a generated ~2GB corpus
+(`scripts/gen-corpus.go`). Real, actually-measured throughput numbers —
+wins and losses both — are in [`BENCHMARKS.md`](BENCHMARKS.md).
+
+`make cover` runs `go test -coverprofile` scoped to `./internal/...` and
+gates on ≥85% line coverage — 89.6% measured on this machine on
+2026-08-30, the same command CI's `coverage` job runs. (This dev
+environment has neither a C compiler nor `make` itself installed — every
+Makefile target above was verified by running its underlying `go`/shell
+commands directly and confirming the same result, not via an actual
+`make` invocation; CI's Linux runners have both.) `make repro-check`
+is the declared Reproducible Build bonus: build twice with identical
+flags, `sha256sum` both, fail if they differ (verified locally — see
+above). `make verify-differential` is an opt-in QA harness
+(`scripts/verify-differential.sh`) cross-checking a handful of filter
+queries (`exists()`/`==`/`>=`) against `jq` as an independent oracle;
+disclosed in `STDLIB.md`'s Disclosures section as dev-only tooling, and
+deliberately never wired into `make test`, `make build`, or CI — it
+skips itself cleanly if `jq` isn't installed.
+
+**CI** (`.github/workflows/ci.yml`): build+test run on a
+linux/macos/windows matrix; `coverage`, `race`, `fuzz-smoke`, `proof`
+(deps-proof.txt regenerated fresh and asserted empty), and `repro-check`
+each run as their own job, `race` and the rest on `ubuntu-latest`
+specifically since that's the one runner guaranteed to have a C
+compiler — this project's own dev environment doesn't, so `-race` itself
+could only be validated by inspection and by running its non-instrumented
+counterpart locally, not by an actual passing `-race` run in this
+session; the workflow is wired to run it in CI, but as of this commit no
+CI run has executed yet to confirm that pass.
 
 ## Usage
 
@@ -220,9 +277,9 @@ malformed-line count) go to stderr, never mixed into stdout.
 
 ## Query Language
 
-The full frozen EBNF, truth tables, and windowing semantics land in
-`GRAMMAR.md` as a dedicated reference doc shortly. In the meantime, both
-halves of the language are fully implemented and tested: the filter half
+The full frozen EBNF, truth tables, and windowing semantics are in
+`GRAMMAR.md`. Both halves of the language are fully implemented and
+tested: the filter half
 (comparisons, `and`/`or`/`not`, `exists()`, `in [...]`, regex match,
 nested paths — see `internal/query/parser.go` and `internal/eval/eval.go`)
 and the pipeline-stage half (`fields`, `sort`, `limit`, `stats` — see
@@ -275,8 +332,9 @@ full spec:
 - **Time features:** `--tz`/`--since`/`--until` and real timestamp
   auto-detection (via the field-priority ladder, exposed as the virtual
   `ts` path) are implemented now (Phase 6 complete). `now` is frozen once
-  at process start — batch mode only; there's no watch mode yet for the
-  "re-evaluate `now` per poll tick" distinction to matter.
+  at process start in batch mode; watch mode re-evaluates it every poll
+  instead — see the determinism-scope note at the top of this README and
+  the Watch mode bullet below.
 - **Signals:** `SIGINT`/`SIGTERM` are wired — the first one stops reading
   new input, flushes whatever partial results already exist (labeled
   `PARTIAL` on stderr), and exits 130; a second one within 2 seconds
@@ -297,10 +355,18 @@ full spec:
   per-shard, not globally, so `-j N>1` can emit up to N separate
   `(other)` rows in a genuine overflow instead of sequential mode's one.
   `-race` itself could not be run in this dev environment (no C
-  compiler; `-race` needs cgo) — the concurrent-access test exists and
-  is reasoned to be race-free (each shard's state is touched only by its
-  own owning goroutine, all cross-goroutine communication is via
-  channels), but hasn't actually been run under the race detector yet.
+  compiler; `-race` needs cgo) — the concurrent-access tests
+  (`tests/chaos/`, `cmd/logq/chaos_test.go`'s high-cardinality/-j
+  cases) exist and the sharded design is reasoned to be race-free (each
+  shard's state is touched only by its own owning goroutine, all
+  cross-goroutine communication is via channels), but a passing `-race`
+  run itself has only been *configured* (CI's `race` job, `ubuntu-latest`,
+  which does have a C compiler), not yet actually observed — no CI run
+  has executed as of this commit. `BENCHMARKS.md` also has a real,
+  measured surprise here: `-j N` is not a throughput win at the scales
+  tested (only stats' own aggregation is sharded; JSON decode, the
+  actual bottleneck, stays single-threaded regardless of `-j`) — read it
+  before reaching for `-j` expecting a speedup.
 - **Watch mode (`-w`/`--watch[=SECONDS]`):** implemented — portable
   poll-tail (`os.Stat` + `os.SameFile`, default 1s interval), no
   fsnotify. Correctly detects and reopens across both rotation styles: a

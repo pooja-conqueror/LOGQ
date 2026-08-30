@@ -4,3 +4,4 @@ dist/
 coverage.*
 *.prof
 *.test
+corpus.jsonl
