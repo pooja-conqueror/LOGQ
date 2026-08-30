@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -100,6 +101,17 @@ Flags:
                          decoding/filtering always stays single-threaded.
                          No effect on a query with no "by"/"every" (one
                          group only, nothing to shard).
+  -w, --watch[=SECONDS]  poll FILE(s) for new content instead of reading
+                         once to EOF (default interval 1s; requires at
+                         least one real FILE, not stdin). now() is
+                         re-evaluated fresh every poll, so a relative
+                         bound (--since -1h, ts >= -1h) behaves as a
+                         genuine rolling window. A stats query's full
+                         accumulated result is re-emitted every poll,
+                         labeled SNAPSHOT on stderr — batch mode's
+                         byte-identical-output determinism guarantee
+                         (§15) is explicitly scoped OUT of watch mode by
+                         design (see README).
   -h, --help             show this help and exit
       --version          show version and exit
 
@@ -170,6 +182,9 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	maxQuery := fs.Int("max-query", query.DefaultMaxQueryLen, "max query text length in characters")
 	workers := fs.Int("j", 1, "parallelize stats aggregation across N shard goroutines")
 	fs.IntVar(workers, "workers", 1, "parallelize stats aggregation across N shard goroutines")
+	watchOpt := &watchFlag{}
+	fs.Var(watchOpt, "w", "watch mode: poll for new content (optional =SECONDS interval)")
+	fs.Var(watchOpt, "watch", "watch mode: poll for new content (optional =SECONDS interval)")
 	help := fs.Bool("h", false, "show help")
 	fs.BoolVar(help, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -232,6 +247,16 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		fmt.Fprintf(stderr, "logq: --workers/-j must be >= 1, got %d\n", *workers)
 		return exitUsage
 	}
+	if watchOpt.enabled {
+		if len(files) == 0 {
+			fmt.Fprintln(stderr, "logq: -w/--watch requires at least one real FILE argument, not stdin")
+			return exitUsage
+		}
+		if slices.Contains(files, "-") {
+			fmt.Fprintln(stderr, "logq: -w/--watch requires real FILE arguments — \"-\" (stdin) can't be watched")
+			return exitUsage
+		}
+	}
 	levelOverrides, err := parseLevelsFlag(*levels)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
@@ -286,7 +311,15 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
-	pl, err := buildPipeline(q.Stages, loc, *maxGroups, *maxSample, *seed, *workers)
+	// Watch mode always forces sequential stats (workers=1 in effect)
+	// regardless of -j: Stats.Snapshot's non-destructive re-flush (used
+	// for SNAPSHOT re-emission every poll) has no ParallelStats
+	// equivalent — a concurrent shard's live state can't be peeked
+	// without pausing its worker goroutine, real extra machinery for a
+	// mode whose poll interval already rate-limits how often this
+	// matters. Documented, not silently different: -j is simply not
+	// honored under -w.
+	pl, statsStage, err := buildPipeline(q.Stages, loc, *maxGroups, *maxSample, *seed, *workers, watchOpt.enabled)
 	if err != nil {
 		// e.g. NewFields' S-8 duplicate-output-column check — still a
 		// compile-time failure, before any I/O.
@@ -294,13 +327,6 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return exitCompile
 	}
 	stagesPresent := len(q.Stages) > 0
-
-	sources, closeAll, err := openSources(files, stdin)
-	if err != nil {
-		fmt.Fprintf(stderr, "logq: %v\n", err)
-		return exitIO
-	}
-	defer closeAll()
 
 	out := bufio.NewWriter(stdout)
 	defer out.Flush()
@@ -315,6 +341,17 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	case "csv":
 		buffered = render.NewCSV()
 	}
+
+	if watchOpt.enabled {
+		return runWatch(ctx, out, buffered, cf, pl, statsStage, stagesPresent, files, *format, *output, loc, *since, *until, watchOpt.interval, *maxDepth, *maxLine, stderr)
+	}
+
+	sources, closeAll, err := openSources(files, stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "logq: %v\n", err)
+		return exitIO
+	}
+	defer closeAll()
 
 	// pl is ONE shared pipeline instance across every source, not rebuilt
 	// per file — this is what makes `limit N` (or a bounded `sort ...
@@ -434,14 +471,22 @@ type bufferedRenderer interface {
 // --workers's values, passed straight through to
 // pipeline.NewParallelStats (workers=1 there is the plain, sequential
 // *Stats path — no parallel overhead unless actually asked for).
-func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64, workers int) (*pipeline.Pipeline, error) {
+// forceSequentialStats (set for -w) always uses NewStatsWithLimits
+// directly instead, ignoring workers entirely — see runCtx's own comment
+// on why watch mode can't use ParallelStats. statsStage is non-nil only
+// when a stats stage exists AND forceSequentialStats was set — it's
+// watch mode's own handle for periodic Snapshot() calls; batch mode has
+// no use for it (nil), since Pipeline.Flush already drives every stage's
+// Flush generically without needing a concrete reference to any one of
+// them.
+func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64, workers int, forceSequentialStats bool) (pl *pipeline.Pipeline, statsStage *pipeline.Stats, err error) {
 	execStages := make([]pipeline.Stage, 0, len(stages))
 	for _, st := range stages {
 		switch s := st.(type) {
 		case *query.FieldsStage:
-			fs, err := pipeline.NewFields(s)
-			if err != nil {
-				return nil, err
+			fs, ferr := pipeline.NewFields(s)
+			if ferr != nil {
+				return nil, nil, ferr
 			}
 			execStages = append(execStages, fs)
 		case *query.SortStage:
@@ -449,16 +494,25 @@ func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSampl
 		case *query.LimitStage:
 			execStages = append(execStages, pipeline.NewLimit(s.Limit))
 		case *query.StatsStage:
-			ss, err := pipeline.NewParallelStats(s, loc, maxGroups, maxSample, seed, workers)
-			if err != nil {
-				return nil, err
+			if forceSequentialStats {
+				ss, serr := pipeline.NewStatsWithLimits(s, loc, maxGroups, maxSample, seed)
+				if serr != nil {
+					return nil, nil, serr
+				}
+				statsStage = ss
+				execStages = append(execStages, ss)
+				continue
+			}
+			ss, serr := pipeline.NewParallelStats(s, loc, maxGroups, maxSample, seed, workers)
+			if serr != nil {
+				return nil, nil, serr
 			}
 			execStages = append(execStages, ss)
 		default:
-			return nil, fmt.Errorf("internal error: unrecognized stage type %T", st)
+			return nil, nil, fmt.Errorf("internal error: unrecognized stage type %T", st)
 		}
 	}
-	return pipeline.New(execStages...), nil
+	return pipeline.New(execStages...), statsStage, nil
 }
 
 // parseLevelsFlag parses --levels' "name=NUM,name2=NUM2" syntax into an

@@ -18,6 +18,18 @@ aggregation package anywhere in the dependency graph.
 incrementally, commit by commit, alongside the code — sections below are
 placeholders until the corresponding feature lands.
 
+**Determinism scope, stated up front:** batch mode (the default — no
+`-w`/`--watch`) produces byte-identical stdout for identical (input
+bytes, query, flags, version), full stop — `now()` frozen once at
+process start, deterministic group ordering, a fixed reservoir seed for
+percentiles. Watch mode (`-w`) is explicitly, deliberately **exempt**
+from that guarantee: it's a live, best-effort view by design — `now()`
+is re-evaluated every poll (so a relative bound like `--since -1h`
+tracks a genuine rolling window instead of freezing), and a stats
+query's accumulated result is re-emitted as a growing `SNAPSHOT` every
+poll rather than a single final answer. Comparing two watch-mode runs
+byte-for-byte was never the goal; comparing two batch-mode runs is.
+
 ## Zero Dependency Hackathon 2026
 
 - **Track:** B — Parsers & Data Formats
@@ -136,6 +148,13 @@ logq 'level == "error"' app.jsonl                 # no stages: still true byte-v
 # -j/--workers: parallelize stats' own aggregation math across N shards
 # (byte-identical output to -j 1 — see Honest Limits below)
 logq -j 4 '| stats count(), avg(duration_ms) by url.path' huge.jsonl
+
+# -w/--watch: poll for new content instead of reading once to EOF (real
+# FILE required, not stdin). now() re-evaluates every poll, so a relative
+# bound tracks a genuine rolling window — see the determinism-scope note
+# at the top of this README for exactly what's exempt in watch mode.
+logq -w 'level == "error"' app.log                  # default 1s poll
+logq -w=5 '| stats count() by service' app.log       # 5s poll, growing SNAPSHOT
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -238,7 +257,26 @@ full spec:
   is reasoned to be race-free (each shard's state is touched only by its
   own owning goroutine, all cross-goroutine communication is via
   channels), but hasn't actually been run under the race detector yet.
-- **Watch mode:** not yet.
+- **Watch mode (`-w`/`--watch[=SECONDS]`):** implemented — portable
+  poll-tail (`os.Stat` + `os.SameFile`, default 1s interval), no
+  fsnotify. Correctly detects and reopens across both rotation styles: a
+  file deleted and recreated (bigger or smaller), and copytruncate
+  (truncated in place). Requires at least one real `FILE` argument, not
+  stdin. `--format auto` still works — detected once from the file's
+  existing content at watch start, separately from where tailing itself
+  begins (which always skips existing content, `tail -f` style — new
+  activity only). `-j`/`--workers` is not honored under `-w` (always
+  sequential stats — see Honest Limits above on why). Line splitting in
+  watch mode is a smaller rule set than batch mode's `LineReader`: `\n`
+  splitting and CRLF-stripping only, no BOM-strip, no oversized-line
+  skip-and-count — a deliberate, documented scope cut, not an oversight.
+  A genuine Windows-only bug was found and fixed while building this:
+  Go's plain `os.Open` on Windows doesn't set `FILE_SHARE_DELETE`, which
+  would have meant an external log rotator could never delete or rename
+  a file `logq -w` was watching, for as long as logq kept it open —
+  fixed via a Windows-specific `syscall.CreateFile` open (stdlib only,
+  no dependency) that explicitly requests it; empirically confirmed
+  broken beforehand and fixed afterward on this dev machine.
 - **Error/summary model:** malformed lines are skipped and counted with a
   single stderr line at the end of a run; the full per-field counter
   breakdown (`--on-error`, coercion-miss counts, etc.) lands in Phase 10.

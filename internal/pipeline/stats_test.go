@@ -134,6 +134,44 @@ func TestStats_ByValuePreservesOriginalKind(t *testing.T) {
 	}
 }
 
+func TestStats_SnapshotDoesNotClearStateAndReflectsGrowth(t *testing.T) {
+	ss := mustStatsStage(t, `| stats count() by service`)
+	s, err := NewStats(ss, time.UTC)
+	if err != nil {
+		t.Fatalf("NewStats error = %v", err)
+	}
+	s.Process(recWithFields(map[string]eval.Value{"service": eval.Str("a")}))
+
+	rows1 := s.Snapshot()
+	if len(rows1) != 1 || rows1[0].Get("count").I != 1 {
+		t.Fatalf("first snapshot = %+v, want one row with count=1", rows1)
+	}
+
+	// More data arrives between snapshots — Snapshot must NOT have
+	// cleared anything, and the SAME Stats keeps accumulating normally.
+	s.Process(recWithFields(map[string]eval.Value{"service": eval.Str("a")}))
+	s.Process(recWithFields(map[string]eval.Value{"service": eval.Str("b")}))
+
+	rows2 := s.Snapshot()
+	if len(rows2) != 2 {
+		t.Fatalf("second snapshot = %+v, want 2 rows (a, b)", rows2)
+	}
+	for _, row := range rows2 {
+		want := map[string]int64{"a": 2, "b": 1}[row.Get("service").S]
+		if row.Get("count").I != want {
+			t.Fatalf("service=%s count=%v, want %d", row.Get("service").S, row.Get("count"), want)
+		}
+	}
+
+	// Flush still works normally afterward and returns the same final
+	// state Snapshot was already showing — Snapshot truly never mutated
+	// anything Flush depends on.
+	rows3 := flushStats(t, s)
+	if len(rows3) != 2 {
+		t.Fatalf("Flush after Snapshot = %+v, want 2 rows", rows3)
+	}
+}
+
 func TestStats_MissingByValueOmittedFromOutputRecord(t *testing.T) {
 	// Regression: a group whose "by" path resolved to MISSING for every
 	// contributing record must not store a Missing-kind Value under that

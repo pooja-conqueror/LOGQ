@@ -188,15 +188,18 @@ type statsRow struct {
 	rec   *eval.Record
 }
 
-// sortedRows drains s into its final §15-ordered row sequence: real
-// groups sorted byte-wise ascending by group key (which, thanks to
-// eval.Timestamp's RFC3339 CellString encoding and eval.Missing's
-// sentinel byte both already being part of that key when windowing is
-// active, also yields "(no-ts) first, then buckets chronologically" for
-// free — no separate sort pass needed), then the collapsed (other) row
-// last, if the cardinality guard ever triggered. s is left empty
-// afterward, same as Flush's own previous contract.
-func (s *Stats) sortedRows() []statsRow {
+// snapshotRows computes s's current §15-ordered row sequence WITHOUT
+// touching any state: real groups sorted byte-wise ascending by group
+// key (which, thanks to eval.Timestamp's RFC3339 CellString encoding
+// and eval.Missing's sentinel byte both already being part of that key
+// when windowing is active, also yields "(no-ts) first, then buckets
+// chronologically" for free — no separate sort pass needed), then the
+// collapsed (other) row last, if the cardinality guard ever triggered.
+// Safe to call repeatedly and get a consistent, growing view each time —
+// every aggregator's own Result() method is a pure read (§8.4's
+// algorithms table), so re-rendering the same group twice is never
+// observably different from rendering it once.
+func (s *Stats) snapshotRows() []statsRow {
 	keys := make([]string, 0, len(s.groups))
 	for k := range s.groups {
 		keys = append(keys, k)
@@ -210,16 +213,38 @@ func (s *Stats) sortedRows() []statsRow {
 	if s.other != nil {
 		rows = append(rows, statsRow{other: true, rec: s.buildRecord(s.other)})
 	}
+	return rows
+}
+
+// sortedRows is snapshotRows plus Flush's own one-shot contract: s is
+// left empty afterward, so a second call returns nothing.
+func (s *Stats) sortedRows() []statsRow {
+	rows := s.snapshotRows()
 	s.groups = nil
 	s.other = nil
 	return rows
 }
 
-// Flush emits one output record per tracked group, in sortedRows' order.
+// Flush emits one output record per tracked group, in sortedRows' order,
+// then clears all state — the batch-mode, end-of-stream contract.
 func (s *Stats) Flush(emit func(*eval.Record)) {
 	for _, row := range s.sortedRows() {
 		emit(row.rec)
 	}
+}
+
+// Snapshot returns the current rows in §15 order WITHOUT clearing any
+// state — for watch mode's repeated SNAPSHOT re-emission every poll
+// interval (§14), where the same accumulating Stats keeps being asked
+// to render its current, still-growing view again and again, unlike
+// Flush's one-shot "this is the final answer" contract.
+func (s *Stats) Snapshot() []*eval.Record {
+	rows := s.snapshotRows()
+	out := make([]*eval.Record, len(rows))
+	for i, row := range rows {
+		out[i] = row.rec
+	}
+	return out
 }
 
 // OverflowedGroups reports how many records were routed into (other) for
