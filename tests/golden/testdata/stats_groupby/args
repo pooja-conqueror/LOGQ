@@ -1,0 +1,2 @@
+| stats count() by service
+input.jsonl

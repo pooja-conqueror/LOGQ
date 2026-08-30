@@ -1,0 +1,6 @@
+-f
+jsonl
+--on-error
+stop
+exists(x)
+input.jsonl

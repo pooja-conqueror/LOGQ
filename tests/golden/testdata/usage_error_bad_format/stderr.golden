@@ -1,0 +1,1 @@
+logq: --format "bogus" not recognized (want auto|jsonl|logfmt|plain)

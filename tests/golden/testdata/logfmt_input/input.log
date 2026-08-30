@@ -1,0 +1,2 @@
+level=info msg="request ok" user=alice
+level=debug msg="no user field"

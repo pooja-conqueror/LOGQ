@@ -134,6 +134,17 @@ Flags:
                          honors the NO_COLOR env var — any value, even
                          empty, disables color; color is never used at
                          all unless stderr is an actual terminal).
+  -q, --quiet            suppress informational stderr output (PARTIAL,
+                         the counter summary, watch mode's SNAPSHOT/
+                         stopped messages) — genuine errors (a compile
+                         failure, an --on-error stop abort, a write
+                         failure) still print regardless.
+  -Q, --query-file FILE  read the query from FILE instead of the command
+                         line ("-" for stdin) — keeps a query containing
+                         a token/credential fragment out of the process
+                         list (ps aux/docker top), same mitigation as
+                         mysql -p. Every remaining positional argument
+                         is then a log FILE, not the query.
   -h, --help             show this help and exit
       --version          show version and exit
 
@@ -210,6 +221,10 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	onError := fs.String("on-error", "warn", "malformed/oversized line handling: skip|warn|stop")
 	noColor := fs.Bool("C", false, "disable ANSI color on stderr diagnostics")
 	fs.BoolVar(noColor, "no-color", false, "disable ANSI color on stderr diagnostics")
+	quiet := fs.Bool("q", false, "suppress informational stderr output (PARTIAL/summary/SNAPSHOT)")
+	fs.BoolVar(quiet, "quiet", false, "suppress informational stderr output (PARTIAL/summary/SNAPSHOT)")
+	queryFile := fs.String("Q", "", "read the query from FILE instead of the command line (\"-\" for stdin)")
+	fs.StringVar(queryFile, "query-file", "", "read the query from FILE instead of the command line (\"-\" for stdin)")
 	help := fs.Bool("h", false, "show help")
 	fs.BoolVar(help, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -228,12 +243,37 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 
 	rest := fs.Args()
-	if len(rest) == 0 {
-		fmt.Fprintln(stderr, "logq: missing QUERY argument")
-		fmt.Fprint(stderr, usageText)
+	// -Q/--query-file: read the query from a file (or stdin, "-") instead
+	// of argv[0] — same reasoning as -Q FILE/mysql -p: a query text
+	// containing a token or credential fragment is otherwise readable by
+	// any local user via `ps aux`/`docker top`, since ordinary argv is
+	// world-visible. When set, EVERY positional argument is a FILE
+	// (there's no longer a query text among them to skip past).
+	var queryText string
+	var files []string
+	if *queryFile != "" {
+		files = rest
+		qt, qerr := readQueryFile(*queryFile, stdin, files)
+		if qerr != nil {
+			fmt.Fprintf(stderr, "logq: %v\n", qerr)
+			if errors.Is(qerr, errQueryFileConflict) {
+				return exitUsage
+			}
+			return exitIO
+		}
+		queryText = qt
+	} else {
+		if len(rest) == 0 {
+			fmt.Fprintln(stderr, "logq: missing QUERY argument")
+			fmt.Fprint(stderr, usageText)
+			return exitUsage
+		}
+		queryText, files = rest[0], rest[1:]
+	}
+	if queryText == "" {
+		fmt.Fprintln(stderr, "logq: query text is empty")
 		return exitUsage
 	}
-	queryText, files := rest[0], rest[1:]
 
 	switch *format {
 	case "auto", "jsonl", "logfmt", "plain":
@@ -382,7 +422,7 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		if statsStage != nil {
 			watchStats = statsStage.(*pipeline.Stats)
 		}
-		return runWatch(ctx, out, buffered, cf, pl, watchStats, stagesPresent, files, *format, *output, loc, *since, *until, watchOpt.interval, *maxDepth, *maxLine, *onError, useColor, stderr)
+		return runWatch(ctx, out, buffered, cf, pl, watchStats, stagesPresent, files, *format, *output, loc, *since, *until, watchOpt.interval, *maxDepth, *maxLine, *onError, useColor, *quiet, stderr)
 	}
 
 	sources, closeAll, err := openSources(files, stdin)
@@ -456,15 +496,16 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// ctx.Err() already answers "was this run interrupted at all,
 	// anywhere" directly.
 	interrupted := ctx.Err() != nil
-	if interrupted {
+	if interrupted && !*quiet {
 		msg := fmt.Sprintf("PARTIAL (interrupted at %d lines) — flushed partial results", counters.LinesRead)
 		fmt.Fprintf(stderr, "logq: %s\n", render.Yellow(useColor, msg))
 	}
-	// --on-error skip suppresses this summary line entirely — the whole
-	// point of "skip" over "warn" (§12.3's own "count, continue" default
-	// still counts internally either way, this only controls whether
-	// that gets reported).
-	if *onError != "skip" && counters.Noteworthy() {
+	// --on-error skip and -q/--quiet both suppress this summary line —
+	// skip because that's its whole point (§12.3's own "count, continue"
+	// default still counts internally either way, this only controls
+	// whether that gets reported); quiet because it asked for exactly
+	// this kind of informational-only output to stay silent.
+	if *onError != "skip" && !*quiet && counters.Noteworthy() {
 		// Red specifically when there's a real decode failure to flag —
 		// dup keys/ts-unparsed/window-drops/overflow alone are routine,
 		// not alarming, so the summary line stays uncolored for those.
@@ -600,6 +641,34 @@ func parseLevelsFlag(s string) (map[string]int, error) {
 		out[name] = n
 	}
 	return out, nil
+}
+
+// errQueryFileConflict marks a usage-level (not I/O) failure reading
+// --query-file — distinguished from a genuine read error so the caller
+// can map it to exit 1 (usage) rather than exit 4 (I/O).
+var errQueryFileConflict = errors.New("--query-file - already reads the query from stdin")
+
+// readQueryFile resolves -Q/--query-file's value into the actual query
+// text: a real path is read via os.ReadFile; "-" reads all of stdin
+// instead — rejected outright if stdin is ALSO one of the FILE arguments
+// (files), since both can't consume the same stdin stream. Trailing
+// whitespace is trimmed either way, matching how a query typed directly
+// on the command line never carries a trailing newline.
+func readQueryFile(path string, stdin io.Reader, files []string) (string, error) {
+	var data []byte
+	var err error
+	if path == "-" {
+		if slices.Contains(files, "-") {
+			return "", fmt.Errorf("%w; provide real FILE arguments for log data instead", errQueryFileConflict)
+		}
+		data, err = io.ReadAll(stdin)
+	} else {
+		data, err = os.ReadFile(path)
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading --query-file %s: %w", path, err)
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // renderRecord writes rec per the requested output mode.

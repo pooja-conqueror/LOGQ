@@ -1,0 +1,4 @@
+-o
+jsonl
+| stats count() by tag
+input.jsonl

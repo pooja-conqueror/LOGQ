@@ -1,0 +1,4 @@
+--max-groups
+2
+| stats count() by service
+input.jsonl

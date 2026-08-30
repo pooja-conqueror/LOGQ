@@ -142,7 +142,7 @@ func detectWatchFormat(path, forcedFormat string, maxLine int) (formats.Format, 
 // frozen now) — this is what makes a relative bound like `ts >= -1h` or
 // `--since -1h` behave as an actual rolling window in watch mode, rather
 // than freezing to whatever "now" was when the session started.
-func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, statsStage *pipeline.Stats, stagesPresent bool, files []string, forcedFormat, output string, loc *time.Location, sinceRaw, untilRaw string, interval time.Duration, maxDepth, maxLine int, onError string, useColor bool, stderr io.Writer) int {
+func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, statsStage *pipeline.Stats, stagesPresent bool, files []string, forcedFormat, output string, loc *time.Location, sinceRaw, untilRaw string, interval time.Duration, maxDepth, maxLine int, onError string, useColor, quiet bool, stderr io.Writer) int {
 	// Watch mode doesn't print a periodic counter summary (its own
 	// SNAPSHOT/rotation stderr messages already serve that role, and a
 	// session with no natural end has no natural "end of run" moment to
@@ -170,7 +170,9 @@ func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer,
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(stderr, "logq: %s\n", render.Yellow(useColor, "watch stopped (interrupted)"))
+			if !quiet {
+				fmt.Fprintf(stderr, "logq: %s\n", render.Yellow(useColor, "watch stopped (interrupted)"))
+			}
 			return exitInterrupted
 		case <-ticker.C:
 			now := time.Now()
@@ -218,8 +220,10 @@ func runWatch(ctx context.Context, out *bufio.Writer, buffered bufferedRenderer,
 			}
 
 			if statsStage != nil {
-				snapshotMsg := fmt.Sprintf("SNAPSHOT (poll at %s)", now.Format(time.RFC3339))
-				fmt.Fprintf(stderr, "logq: %s\n", render.Cyan(useColor, snapshotMsg))
+				if !quiet {
+					snapshotMsg := fmt.Sprintf("SNAPSHOT (poll at %s)", now.Format(time.RFC3339))
+					fmt.Fprintf(stderr, "logq: %s\n", render.Cyan(useColor, snapshotMsg))
+				}
 				for _, rec := range statsStage.Snapshot() {
 					if werr := renderRecord(out, buffered, rec, nil, output, stagesPresent); werr != nil {
 						return writeExitCode(stderr, werr)

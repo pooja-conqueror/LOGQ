@@ -45,6 +45,29 @@ go build -trimpath -buildvcs=false -o bin/logq ./cmd/logq
 
 (A `Makefile` target wraps this: `make build`.)
 
+## Testing
+
+```
+go test ./...       # everything, including the golden suite below
+make test            # same, via the Makefile target
+```
+
+`tests/golden/` is a from-scratch, dependency-free black-box test
+runner (`tests/golden/golden_test.go`): it builds the real `logq`
+binary once, then runs it as a real subprocess against each fixture
+directory under `tests/golden/testdata/` — a query × format × flag
+combination per fixture — comparing stdout, stderr, and exit code
+byte-exact against checked-in golden files. Black-box on purpose (a
+real subprocess, not an in-process call — `cmd/logq` is `package main`
+and isn't importable from outside it anyway): this is what actually
+exercises the full, real, end-user-facing behavior, catching
+integration issues a same-package unit test could miss. Covers filter/
+stats/windowing/top-K queries, all four output formats, gzip and
+logfmt input, `--on-error stop`, `--max-groups` overflow, `--levels`
+overrides, `MISSING`/`Null`/empty-string's three-way distinction, and a
+usage-error exit code — run individually via
+`go test ./tests/golden/ -run TestGolden/<fixture-name>`.
+
 ## Usage
 
 ```
@@ -165,6 +188,17 @@ logq -f jsonl --on-error stop 'exists(x)' app.jsonl
 # -C/--no-color (or NO_COLOR=1): disable stderr's small ANSI palette —
 # never applied to redirected/piped output either way, only a real tty
 logq -C 'level == "error"' app.jsonl
+
+# -q/--quiet: suppress PARTIAL/summary/SNAPSHOT stderr chatter — real
+# errors (a compile failure, an --on-error stop abort) still print
+logq -q 'level == "error"' app.jsonl
+
+# -Q/--query-file: keep a sensitive query out of the process list
+# (ps aux/docker top can read plain argv) — "-" reads the query from
+# stdin instead of a file; every remaining positional arg is then a
+# log FILE, never the query itself
+logq -Q query.txt app.jsonl
+echo 'level == "error"' | logq -Q - app.jsonl
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -315,6 +349,16 @@ full spec:
   `-C`/`--no-color` on top of that. Never active for redirected/piped
   output regardless of flags — verified color never leaks into non-tty
   stderr.
+- **`-q`/`--quiet` and `-Q`/`--query-file`:** implemented. `-q` silences
+  the informational stderr chatter (`PARTIAL`, the counter summary,
+  watch mode's `SNAPSHOT`/stopped messages) — genuine errors (a compile
+  failure, an `--on-error stop` abort, a write failure) always still
+  print, `-q` isn't a way to hide a real failure. `-Q FILE`/`-Q -` reads
+  the query from a file or stdin instead of argv, the same
+  `mysql -p`-style mitigation for a query containing a token/credential
+  fragment (plain argv is readable by any local user via `ps aux`/
+  `docker top`) — when set, every remaining positional argument is a log
+  `FILE`, never the query.
 
 Nothing above is hidden or silently degraded — every one of these either
 fails with a clear, explicit "not yet supported" message or is documented

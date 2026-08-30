@@ -1,0 +1,2 @@
+logq: aborted: --on-error stop
+malformed line: invalid character 'o' in literal null (expecting 'u')

@@ -1,0 +1,4 @@
+-o
+table
+exists(x)
+input.jsonl

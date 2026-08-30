@@ -1,0 +1,4 @@
+--levels
+critical=55
+level >= "warn"
+input.jsonl

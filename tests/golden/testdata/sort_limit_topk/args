@@ -1,0 +1,2 @@
+| stats count() by service | sort count desc limit 2
+input.jsonl

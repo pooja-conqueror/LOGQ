@@ -1,0 +1,4 @@
+-o
+csv
+exists(x)
+input.jsonl

@@ -918,3 +918,123 @@ func TestRun_NoColorNeverLeaksANSIIntoNonTTYOutput(t *testing.T) {
 		t.Fatalf("errOut = %q, must never contain a raw ANSI escape when stderr isn't a terminal", errOut)
 	}
 }
+
+func TestRun_QuietSuppressesSummaryLine(t *testing.T) {
+	stdin := `{"x":1}` + "\n" + `not json at all` + "\n"
+	code, out, errOut := runCLI(t, []string{"-f", "jsonl", "-q", `exists(x)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"x":1}` {
+		t.Fatalf("out = %q, want just the valid line", out)
+	}
+	if errOut != "" {
+		t.Fatalf("errOut = %q, want empty under -q", errOut)
+	}
+}
+
+func TestRun_QuietDoesNotSuppressRealErrors(t *testing.T) {
+	stdin := `{"x":1}` + "\n" + `not json at all` + "\n"
+	code, _, errOut := runCLI(t, []string{"-f", "jsonl", "-q", "--on-error", "stop", `exists(x)`}, stdin)
+	if code != exitDataStrict {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitDataStrict, errOut)
+	}
+	if errOut == "" {
+		t.Fatal("errOut is empty, want the --on-error stop abort message — -q must not silence genuine errors")
+	}
+}
+
+func TestRun_QuietSuppressesPartialLine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	code, _, errOut := runCLICtx(t, ctx, []string{"-q", `exists(x)`}, `{"x":1}`+"\n")
+	if code != exitInterrupted {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitInterrupted, errOut)
+	}
+	if errOut != "" {
+		t.Fatalf("errOut = %q, want empty — -q suppresses PARTIAL too", errOut)
+	}
+}
+
+func TestRun_QueryFileReadsFromRealFile(t *testing.T) {
+	dir := t.TempDir()
+	qpath := filepath.Join(dir, "query.txt")
+	if err := os.WriteFile(qpath, []byte("exists(x)\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	code, out, errOut := runCLI(t, []string{"-Q", qpath}, `{"x":1}`+"\n")
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"x":1}` {
+		t.Fatalf("out = %q, want the matched line", out)
+	}
+}
+
+func TestRun_QueryFileReadsFromStdin(t *testing.T) {
+	// -Q - means "read the query from stdin" — but stdin is also the log
+	// data source in runCLI's own single-stdin harness, so this test
+	// needs a real FILE for the log data, with query text piped via
+	// stdin instead.
+	dir := t.TempDir()
+	dataPath := filepath.Join(dir, "data.jsonl")
+	if err := os.WriteFile(dataPath, []byte(`{"x":1}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	code, out, errOut := runCLI(t, []string{"--query-file", "-", dataPath}, "exists(x)\n")
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"x":1}` {
+		t.Fatalf("out = %q, want the matched line", out)
+	}
+}
+
+func TestRun_QueryFileDashConflictsWithStdinFileArg(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"-Q", "-", "-"}, "exists(x)\n")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_QueryFileMissingFileIsIOError(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"-Q", filepath.Join(t.TempDir(), "does-not-exist.txt")}, "")
+	if code != exitIO {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitIO, errOut)
+	}
+}
+
+func TestRun_QueryFileEmptyIsUsageError(t *testing.T) {
+	dir := t.TempDir()
+	qpath := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(qpath, []byte("   \n"), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v", err)
+	}
+	code, _, errOut := runCLI(t, []string{"-Q", qpath}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_QueryFilePositionalArgsAreAllFiles(t *testing.T) {
+	// With -Q set, there's no query text among the positional args at
+	// all — every one of them is a log FILE, unlike the normal case
+	// where rest[0] is the query.
+	dir := t.TempDir()
+	qpath := filepath.Join(dir, "query.txt")
+	os.WriteFile(qpath, []byte("exists(x)"), 0o644)
+	d1 := filepath.Join(dir, "d1.jsonl")
+	d2 := filepath.Join(dir, "d2.jsonl")
+	os.WriteFile(d1, []byte(`{"x":1}`+"\n"), 0o644)
+	os.WriteFile(d2, []byte(`{"x":2}`+"\n"), 0o644)
+
+	code, out, errOut := runCLI(t, []string{"-Q", qpath, d1, d2}, "")
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	wantLines := []string{`{"x":1}`, `{"x":2}`}
+	gotLines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(gotLines) != 2 || gotLines[0] != wantLines[0] || gotLines[1] != wantLines[1] {
+		t.Fatalf("out = %q, want both files' matched lines", out)
+	}
+}

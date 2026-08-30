@@ -1,0 +1,2 @@
+| stats count() every 1h
+input.jsonl
