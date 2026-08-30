@@ -3,12 +3,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	_ "time/tzdata" // embed the IANA timezone database in the binary — see --tz below
 
@@ -91,12 +94,24 @@ Flags:
       --max-query N      max query text length in characters, checked
                          before any parsing begins (default 8192, up to
                          65536).
+  -j, --workers N        parallelize stats aggregation across N shard
+                         goroutines (default 1 — sequential). Only stats'
+                         own per-group math is parallelized; record
+                         decoding/filtering always stays single-threaded.
+                         No effect on a query with no "by"/"every" (one
+                         group only, nothing to shard).
   -h, --help             show this help and exit
       --version          show version and exit
 
 Results go to stdout only; diagnostics and the end-of-run summary go to
 stderr. logq is under active development — see README.md's Honest Limits
 section for what isn't wired up yet.
+
+SIGINT/SIGTERM: the first signal stops reading new input, flushes
+whatever partial results exist (labeled PARTIAL on stderr), and exits
+130. A second signal within 2 seconds exits immediately, no flush
+guaranteed. Writing to a closed downstream pipe (e.g. "| head -1") exits
+0 silently, never a "write error."
 `
 
 func main() {
@@ -104,8 +119,38 @@ func main() {
 }
 
 // run is the whole CLI, parameterized on its I/O so it's testable without
-// spawning a subprocess (see main_test.go).
+// spawning a subprocess (see main_test.go). It owns the real OS signal
+// context; runCtx is the version with that context injectable, so a test
+// can simulate an interrupt deterministically without sending a real
+// signal to the test process itself.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// §14: one root context from signal.NotifyContext — the first
+	// SIGINT/SIGTERM cancels it, which the read loop below checks to
+	// stop pulling in new input (still flushing whatever partial
+	// results already exist). A genuinely impatient second signal within
+	// 2s of the first forces an immediate exit with no flush guarantee —
+	// NotifyContext itself only ever reacts to the first occurrence
+	// (that's what cancels ctx), so catching a real second one needs its
+	// own raw signal.Notify watch, armed only once the first has fired.
+	ctx, stopNotify := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopNotify()
+	go func() {
+		<-ctx.Done()
+		second := make(chan os.Signal, 1)
+		signal.Notify(second, os.Interrupt, syscall.SIGTERM)
+		select {
+		case <-second:
+			fmt.Fprintln(stderr, "logq: second interrupt — exiting immediately, no flush")
+			os.Exit(exitInterrupted)
+		case <-time.After(2 * time.Second):
+		}
+	}()
+	return runCtx(ctx, args, stdin, stdout, stderr)
+}
+
+// runCtx is run's actual implementation, taking its cancellation context
+// as a parameter.
+func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("logq", flag.ContinueOnError)
 	fs.SetOutput(io.Discard) // we print our own usage/errors, not flag's
 
@@ -123,6 +168,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	maxDepth := fs.Int("max-depth", formats.DefaultMaxDepth, "max JSON nesting depth")
 	maxLine := fs.Int("max-line", formats.DefaultMaxLine, "max input line length in bytes")
 	maxQuery := fs.Int("max-query", query.DefaultMaxQueryLen, "max query text length in characters")
+	workers := fs.Int("j", 1, "parallelize stats aggregation across N shard goroutines")
+	fs.IntVar(workers, "workers", 1, "parallelize stats aggregation across N shard goroutines")
 	help := fs.Bool("h", false, "show help")
 	fs.BoolVar(help, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -181,6 +228,10 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: --max-query must be between 1 and %d, got %d\n", maxQueryCeiling, *maxQuery)
 		return exitUsage
 	}
+	if *workers < 1 {
+		fmt.Fprintf(stderr, "logq: --workers/-j must be >= 1, got %d\n", *workers)
+		return exitUsage
+	}
 	levelOverrides, err := parseLevelsFlag(*levels)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
@@ -235,7 +286,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
-	pl, err := buildPipeline(q.Stages, loc, *maxGroups, *maxSample, *seed)
+	pl, err := buildPipeline(q.Stages, loc, *maxGroups, *maxSample, *seed, *workers)
 	if err != nil {
 		// e.g. NewFields' S-8 duplicate-output-column check — still a
 		// compile-time failure, before any I/O.
@@ -272,22 +323,23 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// just the rest of the current one.
 	var totalLines, malformed, droppedByWindow int
 	for _, src := range sources {
-		n, m, d, done, srcErr := processSource(out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound, *maxDepth, *maxLine)
+		n, m, d, done, srcErr := processSource(ctx, out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound, *maxDepth, *maxLine)
 		totalLines += n
 		malformed += m
 		droppedByWindow += d
 		if srcErr != nil {
-			fmt.Fprintf(stderr, "logq: %v\n", srcErr)
-			return exitIO
+			return writeExitCode(stderr, srcErr)
 		}
 		if done {
-			break // e.g. limit's count reached — no reason to open later files at all
+			break // e.g. limit's count reached, or an interrupt (ctx cancelled) — no reason to open later files at all
 		}
 	}
 
-	// Flush any buffering stage (sort) — its held records still need to
-	// go through the same rendering path a normally-streamed record
-	// would, always, regardless of whether the loop above stopped early.
+	// Flush any buffering stage (sort, stats) — its held records still
+	// need to go through the same rendering path a normally-streamed
+	// record would, always, regardless of whether the loop above stopped
+	// early (including on interrupt — this is the "flush whatever
+	// partial results exist" half of §14's first-signal behavior).
 	var flushErr error
 	pl.Flush(func(rec *eval.Record) {
 		if flushErr != nil {
@@ -296,22 +348,30 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		flushErr = renderRecord(out, buffered, rec, nil, *output, stagesPresent)
 	})
 	if flushErr != nil {
-		fmt.Fprintf(stderr, "logq: write error: %v\n", flushErr)
-		return exitIO
+		return writeExitCode(stderr, flushErr)
 	}
 
 	if buffered != nil {
 		if err := buffered.Flush(out); err != nil {
-			fmt.Fprintf(stderr, "logq: write error: %v\n", err)
-			return exitIO
+			return writeExitCode(stderr, err)
 		}
 	}
 
 	// Flush results before the diagnostic summary, so on a terminal the
 	// matched records appear before the line that describes them.
 	if err := out.Flush(); err != nil {
-		fmt.Fprintf(stderr, "logq: write error: %v\n", err)
-		return exitIO
+		return writeExitCode(stderr, err)
+	}
+
+	// §14: a signal-triggered stop is reported honestly as PARTIAL, not
+	// silently folded into an ordinary exit 0 — checked here (after
+	// everything possible has already been flushed) rather than
+	// threaded as a special return value through processSource, since
+	// ctx.Err() already answers "was this run interrupted at all,
+	// anywhere" directly.
+	interrupted := ctx.Err() != nil
+	if interrupted {
+		fmt.Fprintf(stderr, "logq: PARTIAL (interrupted at %d lines) — flushed partial results\n", totalLines)
 	}
 	if malformed > 0 || droppedByWindow > 0 {
 		// A minimal placeholder for Phase 10's full per-field counter
@@ -320,7 +380,25 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "logq: %d line(s) read, %d malformed, %d dropped by --since/--until\n",
 			totalLines, malformed, droppedByWindow)
 	}
+	if interrupted {
+		return exitInterrupted
+	}
 	return exitOK
+}
+
+// writeExitCode maps a write-path error to its exit code. Go's runtime
+// doesn't deliver SIGPIPE as a signal for a write to stdout/stderr — it
+// surfaces as an ordinary write error instead (EC-40: "SIGPIPE via
+// | head -1 -> silent exit 0") — so a broken downstream pipe (the reader
+// simply stopped wanting more input, e.g. `head -1`) is detected by
+// recognizing that specific error, not by catching a signal, and is
+// never printed as an alarming "write error."
+func writeExitCode(stderr io.Writer, err error) int {
+	if isBrokenPipe(err) {
+		return exitOK
+	}
+	fmt.Fprintf(stderr, "logq: write error: %v\n", err)
+	return exitIO
 }
 
 // parseTimeBound parses a --since/--until value: the literal "now", an
@@ -352,9 +430,11 @@ type bufferedRenderer interface {
 // exactly like an invalid query itself. loc is the run's resolved --tz
 // location, needed by StatsStage's window-bucket alignment (§8.1) even
 // when no "every" clause is present, for API uniformity. maxGroups/
-// maxSample/seed are --max-groups/--max-sample/--seed's values, passed
-// straight through to pipeline.NewStatsWithLimits.
-func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64) (*pipeline.Pipeline, error) {
+// maxSample/seed/workers are --max-groups/--max-sample/--seed/
+// --workers's values, passed straight through to
+// pipeline.NewParallelStats (workers=1 there is the plain, sequential
+// *Stats path — no parallel overhead unless actually asked for).
+func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64, workers int) (*pipeline.Pipeline, error) {
 	execStages := make([]pipeline.Stage, 0, len(stages))
 	for _, st := range stages {
 		switch s := st.(type) {
@@ -369,7 +449,7 @@ func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSampl
 		case *query.LimitStage:
 			execStages = append(execStages, pipeline.NewLimit(s.Limit))
 		case *query.StatsStage:
-			ss, err := pipeline.NewStatsWithLimits(s, loc, maxGroups, maxSample, seed)
+			ss, err := pipeline.NewParallelStats(s, loc, maxGroups, maxSample, seed, workers)
 			if err != nil {
 				return nil, err
 			}
@@ -439,8 +519,12 @@ func renderRecord(out io.Writer, buffered bufferedRenderer, rec *eval.Record, li
 // per-source (§9.2: "Detection cached per file"), never shared across
 // multiple files in one run. A non-nil err is a fatal read/write failure;
 // the caller stops the whole run on it (exit 4). maxDepth/maxLine are
-// --max-depth/--max-line's values.
-func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time, maxDepth, maxLine int) (linesRead, malformed, droppedByWindow int, done bool, err error) {
+// --max-depth/--max-line's values. ctx being Done (§14: first SIGINT/
+// SIGTERM) is treated exactly like the pipeline's own "done" signal —
+// stop reading new lines, return with done=true so the caller stops
+// opening any further sources too, but nothing already decoded is
+// discarded.
+func processSource(ctx context.Context, out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time, maxDepth, maxLine int) (linesRead, malformed, droppedByWindow int, done bool, err error) {
 	gzr, err := formats.MaybeGunzip(src)
 	if err != nil {
 		return 0, 0, 0, false, err
@@ -486,7 +570,14 @@ func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFi
 	// The sample lines were already consumed from lr during auto-detection
 	// (or is empty, when forcedFormat skipped detection entirely) — they
 	// must be processed before reading any further, or they'd be lost.
+	// Still ctx-checked per line, same as the main loop below: an
+	// interrupt arriving during/right after the sampling phase itself
+	// should stop just as promptly, not process a whole buffered batch
+	// unconditionally first.
 	for _, line := range sample {
+		if ctx.Err() != nil {
+			return linesRead, malformed, droppedByWindow, true, nil
+		}
 		stop, werr := process(line)
 		if werr != nil {
 			return linesRead, malformed, droppedByWindow, false, werr
@@ -496,6 +587,9 @@ func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFi
 		}
 	}
 	for {
+		if ctx.Err() != nil {
+			return linesRead, malformed, droppedByWindow, true, nil
+		}
 		line, lerr := lr.ReadLine()
 		if line != nil {
 			stop, werr := process(line)

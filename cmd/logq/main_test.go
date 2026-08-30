@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,17 @@ func runCLI(t *testing.T, args []string, stdin string) (exitCode int, stdout, st
 	t.Helper()
 	var outBuf, errBuf bytes.Buffer
 	code := run(args, strings.NewReader(stdin), &outBuf, &errBuf)
+	return code, outBuf.String(), errBuf.String()
+}
+
+// runCLICtx is runCLI with an injectable context, so a test can simulate
+// an interrupt (§14) deterministically — a pre-cancelled context, or one
+// a test cancels mid-read via a custom io.Reader — without sending a
+// real OS signal to the test process itself.
+func runCLICtx(t *testing.T, ctx context.Context, args []string, stdin string) (exitCode int, stdout, stderr string) {
+	t.Helper()
+	var outBuf, errBuf bytes.Buffer
+	code := runCtx(ctx, args, strings.NewReader(stdin), &outBuf, &errBuf)
 	return code, outBuf.String(), errBuf.String()
 }
 
@@ -706,5 +718,66 @@ func TestRun_LevelsFlagMalformedEntryRejected(t *testing.T) {
 	code, _, errOut := runCLI(t, []string{"--levels", "notanumber", `exists(x)`}, "")
 	if code != exitUsage {
 		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_WorkersFlagRejectsNonPositive(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"-j", "0", `| stats count()`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_WorkersFlagProducesCorrectGroupedOutput(t *testing.T) {
+	var sb strings.Builder
+	for i := range 500 {
+		fmt.Fprintf(&sb, `{"service":"svc%02d"}`+"\n", i%23)
+	}
+	code1, out1, err1 := runCLI(t, []string{"--workers", "1", `| stats count() by service`}, sb.String())
+	code4, out4, err4 := runCLI(t, []string{"-j", "4", `| stats count() by service`}, sb.String())
+	if code1 != exitOK || code4 != exitOK {
+		t.Fatalf("exit = %d / %d (stderr: %q / %q)", code1, code4, err1, err4)
+	}
+	if out1 != out4 {
+		t.Fatalf("-j 1 and -j 4 output diverged:\n-j 1: %q\n-j 4: %q", out1, out4)
+	}
+}
+
+func TestRun_InterruptedContextReportsPartialAndExits130(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate an interrupt having already arrived before any input is read
+	code, out, errOut := runCLICtx(t, ctx, []string{`exists(x)`}, `{"x":1}`+"\n")
+	if code != exitInterrupted {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitInterrupted, errOut)
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want no output — the context was cancelled before any line could be read", out)
+	}
+	if !strings.Contains(errOut, "PARTIAL") {
+		t.Fatalf("errOut = %q, want it to mention PARTIAL", errOut)
+	}
+}
+
+func TestRun_NonInterruptedContextBehavesNormally(t *testing.T) {
+	// Sanity check that runCLICtx with a live (non-cancelled) context is
+	// just runCLI — the injectable-context refactor didn't change
+	// ordinary behavior.
+	ctx := context.Background()
+	code, out, errOut := runCLICtx(t, ctx, []string{`exists(x)`}, `{"x":1}`+"\n")
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.TrimRight(out, "\n") != `{"x":1}` {
+		t.Fatalf("out = %q, want the matched line", out)
+	}
+}
+
+func TestIsBrokenPipe_RejectsUnrelatedErrors(t *testing.T) {
+	// The platform-specific positive cases (which real errno each
+	// implementation recognizes) live in sigpipe_unix_test.go /
+	// sigpipe_windows_test.go, since sigpipe_unix.go and
+	// sigpipe_windows.go check different actual errno values.
+	if isBrokenPipe(fmt.Errorf("some unrelated error")) {
+		t.Error("isBrokenPipe(unrelated error) = true, want false")
 	}
 }

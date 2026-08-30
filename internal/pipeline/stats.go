@@ -109,17 +109,18 @@ func NewStatsWithLimits(ss *query.StatsStage, loc *time.Location, maxGroups, max
 	return s, nil
 }
 
-// Process updates the group (or the (other)/(no-ts) partition) rec's key
-// resolves to. It never emits — see the type doc comment.
-func (s *Stats) Process(rec *eval.Record) (*eval.Record, bool, bool) {
-	byValues := make([]eval.Value, len(s.by))
+// groupKey computes the group-key string rec resolves to under this
+// Stats config (window bucket, if any, then the "by" tuple), plus the
+// pieces buildRecord/Process each separately need — factored out so
+// GroupKeyFor (exported, for a parallel dispatcher) and Process share
+// exactly one implementation of this logic.
+func (s *Stats) groupKey(rec *eval.Record) (key string, byValues []eval.Value, hasBucket bool, bucketStart time.Time) {
+	byValues = make([]eval.Value, len(s.by))
 	for i, p := range s.by {
 		byValues[i] = rec.Resolve(p)
 	}
 
 	keyValues := make([]eval.Value, 0, len(byValues)+1)
-	var bucketStart time.Time
-	hasBucket := false
 	if s.every > 0 {
 		if rec.HasTime {
 			bucketStart = agg.WindowBucket(rec.Time, s.every, s.loc)
@@ -135,7 +136,24 @@ func (s *Stats) Process(rec *eval.Record) (*eval.Record, bool, bool) {
 		}
 	}
 	keyValues = append(keyValues, byValues...)
-	key := agg.GroupKey(keyValues)
+	return agg.GroupKey(keyValues), byValues, hasBucket, bucketStart
+}
+
+// GroupKeyFor computes the group key rec would resolve to under this
+// Stats config, without touching any aggregator state — exposed so a
+// parallel dispatcher (ParallelStats) can pick a deterministic shard for
+// rec before routing it to a worker, using the exact same key logic
+// Process itself uses internally, so records for the same group always
+// land on the same shard regardless of which shard instance is asked.
+func (s *Stats) GroupKeyFor(rec *eval.Record) string {
+	key, _, _, _ := s.groupKey(rec)
+	return key
+}
+
+// Process updates the group (or the (other)/(no-ts) partition) rec's key
+// resolves to. It never emits — see the type doc comment.
+func (s *Stats) Process(rec *eval.Record) (*eval.Record, bool, bool) {
+	key, byValues, hasBucket, bucketStart := s.groupKey(rec)
 
 	g, exists := s.groups[key]
 	if !exists {
@@ -158,27 +176,50 @@ func (s *Stats) Process(rec *eval.Record) (*eval.Record, bool, bool) {
 	return nil, false, false
 }
 
-// Flush emits one output record per tracked group, ordered per §15: real
+// statsRow pairs a group's sort key with its rendered output row — used
+// both by Stats' own Flush and by ParallelStats, which needs each
+// shard's rows re-sorted together as one global sequence rather than
+// emitted shard-by-shard. other is true only for the single collapsed
+// cardinality-overflow row, which never participates in the byte-wise
+// key sort (§15: always last, unconditionally).
+type statsRow struct {
+	key   string
+	other bool
+	rec   *eval.Record
+}
+
+// sortedRows drains s into its final §15-ordered row sequence: real
 // groups sorted byte-wise ascending by group key (which, thanks to
 // eval.Timestamp's RFC3339 CellString encoding and eval.Missing's
 // sentinel byte both already being part of that key when windowing is
 // active, also yields "(no-ts) first, then buckets chronologically" for
-// free — no separate sort pass needed), then the single collapsed
-// (other) row last, if the cardinality guard ever triggered.
-func (s *Stats) Flush(emit func(*eval.Record)) {
+// free — no separate sort pass needed), then the collapsed (other) row
+// last, if the cardinality guard ever triggered. s is left empty
+// afterward, same as Flush's own previous contract.
+func (s *Stats) sortedRows() []statsRow {
 	keys := make([]string, 0, len(s.groups))
 	for k := range s.groups {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys) // Go's string < is already byte-wise — matches §15 directly
+
+	rows := make([]statsRow, 0, len(keys)+1)
 	for _, k := range keys {
-		emit(s.buildRecord(s.groups[k]))
+		rows = append(rows, statsRow{key: k, rec: s.buildRecord(s.groups[k])})
 	}
 	if s.other != nil {
-		emit(s.buildRecord(s.other))
+		rows = append(rows, statsRow{other: true, rec: s.buildRecord(s.other)})
 	}
 	s.groups = nil
 	s.other = nil
+	return rows
+}
+
+// Flush emits one output record per tracked group, in sortedRows' order.
+func (s *Stats) Flush(emit func(*eval.Record)) {
+	for _, row := range s.sortedRows() {
+		emit(row.rec)
+	}
 }
 
 // OverflowedGroups reports how many records were routed into (other) for

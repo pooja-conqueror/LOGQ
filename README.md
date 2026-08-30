@@ -132,6 +132,10 @@ logq '| stats count() by service every 1h' app.jsonl
 # materializing more than the top K groups.
 logq '| stats count() by url.path | sort count desc limit 10' app.jsonl
 logq 'level == "error"' app.jsonl                 # no stages: still true byte-verbatim raw
+
+# -j/--workers: parallelize stats' own aggregation math across N shards
+# (byte-identical output to -j 1 — see Honest Limits below)
+logq -j 4 '| stats count(), avg(duration_ms) by url.path' huge.jsonl
 ```
 
 `-f`/`--format` accepts `auto` (default — samples the first 64 non-empty
@@ -210,7 +214,31 @@ full spec:
   `ts` path) are implemented now (Phase 6 complete). `now` is frozen once
   at process start — batch mode only; there's no watch mode yet for the
   "re-evaluate `now` per poll tick" distinction to matter.
-- **Watch mode, signals, parallelism:** not yet (Phase 9).
+- **Signals:** `SIGINT`/`SIGTERM` are wired — the first one stops reading
+  new input, flushes whatever partial results already exist (labeled
+  `PARTIAL` on stderr), and exits 130; a second one within 2 seconds
+  exits immediately with no flush guarantee. A closed downstream pipe
+  (`logq ... | head -1`) exits 0 silently, never an alarming "write
+  error" — verified against the real binary (`PIPESTATUS` shows logq's
+  own exit code is 0, stderr empty).
+- **Parallelism:** `-j`/`--workers N` parallelizes stats' own per-group
+  aggregation math across N goroutines, each with an independent,
+  lock-free `*Stats` shard over a disjoint slice of the group-key space
+  (sharded by hashing the record's own group key, so a given group
+  always lands on the same shard — never a round-robin split that would
+  need merging partial aggregate state for the same group back together)
+  — the rest of the pipeline (decoding, filtering) stays single-threaded
+  regardless of `-j`. Verified byte-identical output between `-j 1` and
+  `-j N` for N up to 16 over a 2000-record fixture. One honest scoping
+  exception: the cardinality guard (`--max-groups`) is enforced
+  per-shard, not globally, so `-j N>1` can emit up to N separate
+  `(other)` rows in a genuine overflow instead of sequential mode's one.
+  `-race` itself could not be run in this dev environment (no C
+  compiler; `-race` needs cgo) — the concurrent-access test exists and
+  is reasoned to be race-free (each shard's state is touched only by its
+  own owning goroutine, all cross-goroutine communication is via
+  channels), but hasn't actually been run under the race detector yet.
+- **Watch mode:** not yet.
 - **Error/summary model:** malformed lines are skipped and counted with a
   single stderr line at the end of a run; the full per-field counter
   breakdown (`--on-error`, coercion-miss counts, etc.) lands in Phase 10.
