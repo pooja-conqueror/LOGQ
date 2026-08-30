@@ -57,5 +57,5 @@ func csvCellString(v eval.Value) string {
 	if v.Kind == eval.KindMissing || v.Kind == eval.KindNull {
 		return ""
 	}
-	return CellString(v)
+	return eval.CellString(v)
 }

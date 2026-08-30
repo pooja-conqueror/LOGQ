@@ -69,7 +69,7 @@ func writeValue(buf *bytes.Buffer, v eval.Value) error {
 		}
 		return nil
 	case eval.KindNumber:
-		buf.WriteString(NumberString(v))
+		buf.WriteString(eval.NumberString(v))
 		return nil
 	case eval.KindString:
 		s, err := json.Marshal(v.S)
@@ -79,14 +79,14 @@ func writeValue(buf *bytes.Buffer, v eval.Value) error {
 		buf.Write(s)
 		return nil
 	case eval.KindTimestamp:
-		s, err := json.Marshal(TimestampString(v))
+		s, err := json.Marshal(eval.TimestampString(v))
 		if err != nil {
 			return err
 		}
 		buf.Write(s)
 		return nil
 	case eval.KindDuration:
-		s, err := json.Marshal(DurationString(v))
+		s, err := json.Marshal(eval.DurationString(v))
 		if err != nil {
 			return err
 		}

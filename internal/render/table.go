@@ -51,7 +51,7 @@ func (t *Table) Flush(w io.Writer) error {
 	for _, rec := range t.recs {
 		row := make([]string, len(cols))
 		for i, col := range cols {
-			row[i] = clampCell(CellString(rec.Get(col)))
+			row[i] = clampCell(eval.CellString(rec.Get(col)))
 		}
 		rows = append(rows, row)
 	}
@@ -159,35 +159,6 @@ func padLeft(s string, width int) string {
 	return strings.Repeat(" ", width-n) + s
 }
 
-// CellString renders v as plain text for a table/csv cell — the shared
-// "how do I show this value as one cell" logic behind both renderers
-// (§11.5). MISSING renders "(missing)" here (a human-facing table wants
-// it visible, distinct from Null); csv.go overrides this one case to an
-// empty cell instead, per §11.3's own distinct rule.
-func CellString(v eval.Value) string {
-	switch v.Kind {
-	case eval.KindMissing:
-		return "(missing)"
-	case eval.KindNull:
-		return "null"
-	case eval.KindBool:
-		if v.B {
-			return "true"
-		}
-		return "false"
-	case eval.KindNumber:
-		return NumberString(v)
-	case eval.KindString:
-		return v.S
-	case eval.KindTimestamp:
-		return TimestampString(v)
-	case eval.KindDuration:
-		return DurationString(v)
-	case eval.KindArray:
-		return "[array]"
-	case eval.KindObject:
-		return "[object]"
-	default:
-		return ""
-	}
-}
+// CellString has moved to eval.CellString — see its doc comment there for
+// why (the canonical value-rendering rules "feed groups, table, csv" per
+// §11.5, so they live in the shared lower layer, not here).
