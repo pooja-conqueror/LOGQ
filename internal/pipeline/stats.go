@@ -50,6 +50,7 @@ type Stats struct {
 
 	maxGroups int
 	maxSample int
+	seed      int64
 
 	groups     map[string]*statGroup
 	other      *statGroup
@@ -57,19 +58,20 @@ type Stats struct {
 }
 
 // NewStats builds a Stats stage from the parsed StatsStage AST, using the
-// package's default cardinality cap and agg's default percentile
-// reservoir cap. loc is the run's resolved --tz location — required
-// unconditionally for API simplicity even though it's only actually
-// consulted when ss.Every != "" (§8.1's civil-day bucket alignment).
+// package's default cardinality cap and agg's own default percentile
+// reservoir cap and seed. loc is the run's resolved --tz location —
+// required unconditionally for API simplicity even though it's only
+// actually consulted when ss.Every != "" (§8.1's civil-day bucket
+// alignment).
 func NewStats(ss *query.StatsStage, loc *time.Location) (*Stats, error) {
-	return NewStatsWithLimits(ss, loc, DefaultMaxGroups, 0)
+	return NewStatsWithLimits(ss, loc, DefaultMaxGroups, 0, agg.DefaultReservoirSeed)
 }
 
 // NewStatsWithLimits is NewStats with explicit overrides — maxSample <= 0
-// means "use agg's own default" — exported mainly so tests (and a later
-// --max-groups/--max-sample flag wiring commit) can exercise non-default
-// caps without waiting on that flag plumbing to exist yet.
-func NewStatsWithLimits(ss *query.StatsStage, loc *time.Location, maxGroups, maxSample int) (*Stats, error) {
+// means "use agg's own default" — exported so a --max-groups/--max-sample/
+// --seed flag can override the defaults without duplicating this
+// constructor's logic.
+func NewStatsWithLimits(ss *query.StatsStage, loc *time.Location, maxGroups, maxSample int, seed int64) (*Stats, error) {
 	var every time.Duration
 	if ss.Every != "" {
 		d, err := time.ParseDuration(ss.Every)
@@ -89,6 +91,7 @@ func NewStatsWithLimits(ss *query.StatsStage, loc *time.Location, maxGroups, max
 		loc:       loc,
 		maxGroups: maxGroups,
 		maxSample: maxSample,
+		seed:      seed,
 		groups:    make(map[string]*statGroup),
 	}
 
@@ -100,7 +103,7 @@ func NewStatsWithLimits(ss *query.StatsStage, loc *time.Location, maxGroups, max
 	// case at all: it just emits whatever's in s.groups, and this one is
 	// already there even if Process is never called.
 	if len(s.by) == 0 && s.every == 0 {
-		s.groups[agg.GroupKey(nil)] = newStatGroup(nil, s.fns, false, s.maxSample)
+		s.groups[agg.GroupKey(nil)] = newStatGroup(nil, s.fns, false, s.maxSample, s.seed)
 	}
 
 	return s, nil
@@ -139,11 +142,11 @@ func (s *Stats) Process(rec *eval.Record) (*eval.Record, bool, bool) {
 		if int64(len(s.groups)) >= int64(s.maxGroups) {
 			s.overflowed++
 			if s.other == nil {
-				s.other = newStatGroup(nil, s.fns, true, s.maxSample)
+				s.other = newStatGroup(nil, s.fns, true, s.maxSample, s.seed)
 			}
 			g = s.other
 		} else {
-			g = newStatGroup(byValues, s.fns, false, s.maxSample)
+			g = newStatGroup(byValues, s.fns, false, s.maxSample, s.seed)
 			g.hasBucket = hasBucket
 			g.bucketStart = bucketStart
 			s.groups[key] = g
@@ -266,10 +269,10 @@ type statGroup struct {
 	aggs        []statAggregator
 }
 
-func newStatGroup(byValues []eval.Value, fns []query.StatFn, isOther bool, maxSample int) *statGroup {
+func newStatGroup(byValues []eval.Value, fns []query.StatFn, isOther bool, maxSample int, seed int64) *statGroup {
 	aggs := make([]statAggregator, len(fns))
 	for i, fn := range fns {
-		aggs[i] = newStatAggregator(fn, isOther, maxSample)
+		aggs[i] = newStatAggregator(fn, isOther, maxSample, seed)
 	}
 	return &statGroup{byValues: byValues, isOther: isOther, aggs: aggs}
 }
@@ -284,7 +287,7 @@ type statAggregator interface {
 	Result() eval.Value
 }
 
-func newStatAggregator(fn query.StatFn, isOther bool, maxSample int) statAggregator {
+func newStatAggregator(fn query.StatFn, isOther bool, maxSample int, seed int64) statAggregator {
 	// §8.3: "(other) group holding counts only ... count_distinct inside
 	// (other) reports ∅" — merging count_distinct sets from many
 	// different original groups would misrepresent each one's actual
@@ -308,11 +311,11 @@ func newStatAggregator(fn query.StatFn, isOther bool, maxSample int) statAggrega
 	case query.StatMax:
 		return &minMaxStatAgg{path: fn.Path, mm: agg.NewMax()}
 	case query.StatP50:
-		return newPercentileStatAgg(fn.Path, 0.5, maxSample)
+		return newPercentileStatAgg(fn.Path, 0.5, maxSample, seed)
 	case query.StatP95:
-		return newPercentileStatAgg(fn.Path, 0.95, maxSample)
+		return newPercentileStatAgg(fn.Path, 0.95, maxSample, seed)
 	case query.StatP99:
-		return newPercentileStatAgg(fn.Path, 0.99, maxSample)
+		return newPercentileStatAgg(fn.Path, 0.99, maxSample, seed)
 	default:
 		panic(fmt.Sprintf("internal error: unhandled StatFnKind %v survived parsing", fn.Kind))
 	}
@@ -407,12 +410,11 @@ type percentileStatAgg struct {
 	p    *agg.Percentile
 }
 
-func newPercentileStatAgg(path *query.PathRef, q float64, maxSample int) *percentileStatAgg {
-	p := agg.NewPercentile(q)
-	if maxSample > 0 {
-		p = agg.NewPercentileWithCap(q, maxSample)
+func newPercentileStatAgg(path *query.PathRef, q float64, maxSample int, seed int64) *percentileStatAgg {
+	if maxSample <= 0 {
+		maxSample = agg.DefaultMaxSample
 	}
-	return &percentileStatAgg{path: path, p: p}
+	return &percentileStatAgg{path: path, p: agg.NewPercentileWithSeed(q, maxSample, seed)}
 }
 
 func (a *percentileStatAgg) AddRecord(rec *eval.Record) { a.p.Add(rec.Resolve(a.path)) }

@@ -29,8 +29,9 @@ func (e *CompileError) Error() string {
 // package's AST stays the single source of syntax truth and eval never
 // needs a parallel tree of its own.
 type CompiledFilter struct {
-	Expr     query.Expr
-	patterns map[*query.Regex]*regexp.Regexp
+	Expr       query.Expr
+	patterns   map[*query.Regex]*regexp.Regexp
+	levelTable map[string]int // nil means tryLevelOrdinal uses eval's own built-in default
 }
 
 // Compile walks expr once, compiling every Regex node's pattern via the
@@ -41,7 +42,17 @@ type CompiledFilter struct {
 // per-record failure. expr may be nil, meaning "match every record" (the
 // bare-stage-pipeline case, e.g. `| stats count() by remote_addr`).
 func Compile(expr query.Expr) (*CompiledFilter, error) {
-	cf := &CompiledFilter{Expr: expr, patterns: map[*query.Regex]*regexp.Regexp{}}
+	return CompileWithLevelTable(expr, nil)
+}
+
+// CompileWithLevelTable is Compile with an explicit level-ordinal table —
+// nil means the built-in default (LevelOrdinalFromTable's own fallback);
+// pass MergeLevelTable's result for a --levels override. Exported
+// separately from Compile rather than as an optional parameter, matching
+// this codebase's established WithX constructor convention (e.g.
+// agg.NewPercentileWithSeed, pipeline.NewStatsWithLimits).
+func CompileWithLevelTable(expr query.Expr, levelTable map[string]int) (*CompiledFilter, error) {
+	cf := &CompiledFilter{Expr: expr, patterns: map[*query.Regex]*regexp.Regexp{}, levelTable: levelTable}
 	if err := cf.compileNode(expr); err != nil {
 		return nil, err
 	}
@@ -243,8 +254,8 @@ func (cf *CompiledFilter) tryLevelOrdinal(n *query.Cmp, l, r Value) (Order, bool
 	if !isLevelPath(n.L) && !isLevelPath(n.R) {
 		return 0, false
 	}
-	lo, lok := LevelOrdinalFromTable(l, nil)
-	ro, rok := LevelOrdinalFromTable(r, nil)
+	lo, lok := LevelOrdinalFromTable(l, cf.levelTable)
+	ro, rok := LevelOrdinalFromTable(r, cf.levelTable)
 	if lok && rok {
 		return orderFrom(lo < ro, lo == ro), true
 	}

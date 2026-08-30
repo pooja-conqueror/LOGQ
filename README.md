@@ -200,7 +200,11 @@ full spec:
   count. `limit`/a bounded `sort ... limit N` even stop reading further
   input (including later files entirely) once satisfied, since the
   pipeline is one shared instance across the whole run, not rebuilt per
-  file.
+  file. `p50`/`p95`/`p99` are exact under `--max-sample` (default
+  100000), approximate beyond it with a `*`-marked cell, drawn from a
+  fixed-seed (`--seed`, default 0) reservoir so approximate output stays
+  reproducible across runs. `--levels name=NUM,...` extends/overrides the
+  level-ordinal table (§6.2) used by `level >= "warn"`-style comparisons.
 - **Time features:** `--tz`/`--since`/`--until` and real timestamp
   auto-detection (via the field-priority ladder, exposed as the virtual
   `ts` path) are implemented now (Phase 6 complete). `now` is frozen once
@@ -210,9 +214,11 @@ full spec:
 - **Error/summary model:** malformed lines are skipped and counted with a
   single stderr line at the end of a run; the full per-field counter
   breakdown (`--on-error`, coercion-miss counts, etc.) lands in Phase 10.
-- **Depth/size limits:** JSON nesting is capped at 32 levels (not yet
-  configurable via `--max-depth`); oversized lines (>1MB) are skipped and
-  counted, not configurable via `--max-line` yet either.
+- **Depth/size/query limits:** JSON nesting (default 32, `--max-depth`),
+  oversized lines (default 1MB, up to 16MB, `--max-line`), and query text
+  length (default 8192 characters, up to 65536, `--max-query`) are all
+  configurable now. A line or query exceeding its limit is skipped/
+  rejected and counted — never silently truncated.
 
 Nothing above is hidden or silently degraded — every one of these either
 fails with a clear, explicit "not yet supported" message or is documented

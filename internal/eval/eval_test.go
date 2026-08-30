@@ -261,6 +261,35 @@ func TestCoercionWiring_LevelOrdinalUnknownTokenFallsBackToStringCompare(t *test
 	}
 }
 
+func TestCompileWithLevelTable_OverrideMakesUnknownTokenOrdinal(t *testing.T) {
+	rec := NewRecord()
+	rec.Set("level", Str("critical")) // unrecognized by the built-in table alone
+
+	expr, err := query.ParseFilterExpr(`level >= "warn"`)
+	if err != nil {
+		t.Fatalf("parse error = %v", err)
+	}
+
+	// Without an override: "critical" is unknown, falls back to byte-wise
+	// string compare ("critical" < "warn" alphabetically -> false here).
+	cfDefault, err := CompileWithLevelTable(expr, nil)
+	if err != nil {
+		t.Fatalf("compile error = %v", err)
+	}
+	if cfDefault.Eval(rec, time.Now()) {
+		t.Fatal(`without an override, level "critical" >= "warn" should be false (byte-wise fallback)`)
+	}
+
+	// With critical=55 merged in: resolves ordinally, 55 >= 40 -> true.
+	cfOverridden, err := CompileWithLevelTable(expr, MergeLevelTable(map[string]int{"critical": 55}))
+	if err != nil {
+		t.Fatalf("compile error = %v", err)
+	}
+	if !cfOverridden.Eval(rec, time.Now()) {
+		t.Fatal(`with critical=55 merged in, level "critical" (55) >= "warn" (40) should be true ordinally`)
+	}
+}
+
 func TestCoercionWiring_TimestampDuration(t *testing.T) {
 	now := time.Date(2026, 8, 29, 12, 0, 0, 0, time.UTC)
 	rec := NewRecord()

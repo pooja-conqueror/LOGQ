@@ -578,3 +578,133 @@ func TestRun_StatsStageFieldsCannotFollow(t *testing.T) {
 		t.Fatalf("errOut = %q, want it to mention the terminal-stage rule", errOut)
 	}
 }
+
+func TestRun_MaxGroupsFlagCollapsesToOther(t *testing.T) {
+	stdin := `{"service":"a"}` + "\n" + `{"service":"b"}` + "\n" + `{"service":"c"}` + "\n"
+	code, out, errOut := runCLI(t, []string{"--max-groups", "2", `| stats count() by service`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(out, `"service":"(other)"`) {
+		t.Fatalf("out = %q, want a collapsed (other) row once the 2-group cap is exceeded", out)
+	}
+}
+
+func TestRun_MaxGroupsFlagRejectsNonPositive(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--max-groups", "0", `| stats count()`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_MaxSampleFlagForcesApproxPercentile(t *testing.T) {
+	var sb strings.Builder
+	for i := range 50 {
+		fmt.Fprintf(&sb, `{"x":%d}`+"\n", i)
+	}
+	code, out, errOut := runCLI(t, []string{"--max-sample", "5", `| stats p50(x)`}, sb.String())
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if !strings.Contains(out, `*"`) {
+		t.Fatalf("out = %q, want an approximate (\"*\"-marked) p50 cell once the 5-item cap is exceeded by 50 records", out)
+	}
+}
+
+func TestRun_SeedFlagIsDeterministicAcrossRuns(t *testing.T) {
+	var sb strings.Builder
+	for i := range 500 {
+		fmt.Fprintf(&sb, `{"x":%d}`+"\n", i)
+	}
+	stdin := sb.String()
+	args := []string{"--seed", "42", "--max-sample", "10", `| stats p95(x)`}
+	_, out1, err1 := runCLI(t, args, stdin)
+	_, out2, err2 := runCLI(t, args, stdin)
+	if err1 != "" || err2 != "" {
+		t.Fatalf("unexpected stderr: %q / %q", err1, err2)
+	}
+	if out1 != out2 {
+		t.Fatalf("same --seed over identical input diverged: %q vs %q", out1, out2)
+	}
+}
+
+func TestRun_MaxDepthFlagRejectsDeepNesting(t *testing.T) {
+	stdin := `{"a":{"b":{"c":1}}}` + "\n" // 3 levels deep
+	code, out, errOut := runCLI(t, []string{"--max-depth", "2", `exists(a)`}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if out != "" {
+		t.Fatalf("out = %q, want no output — the line exceeds --max-depth 2 and should be counted malformed", out)
+	}
+	if !strings.Contains(errOut, "1 malformed") {
+		t.Fatalf("errOut = %q, want it to report 1 malformed line", errOut)
+	}
+}
+
+func TestRun_MaxLineFlagSkipsOversizedLines(t *testing.T) {
+	longLine := `{"msg":"` + strings.Repeat("x", 200) + `"}`
+	stdin := longLine + "\n" + `{"msg":"short"}` + "\n"
+	code, out, errOut := runCLI(t, []string{"--max-line", "50", "exists(msg)"}, stdin)
+	if code != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", code, errOut)
+	}
+	if strings.Contains(out, "200") || !strings.Contains(out, "short") {
+		t.Fatalf("out = %q, want only the short line to survive a 50-byte --max-line", out)
+	}
+}
+
+func TestRun_MaxLineFlagRejectsOverCeiling(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--max-line", "99999999", `exists(x)`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_MaxQueryFlagRejectsOverLength(t *testing.T) {
+	longQuery := "exists(" + strings.Repeat("a", 100) + ")"
+	code, _, errOut := runCLI(t, []string{"--max-query", "20", longQuery}, "")
+	if code != exitCompile {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitCompile, errOut)
+	}
+	if !strings.Contains(errOut, "exceeds") {
+		t.Fatalf("errOut = %q, want it to explain the length limit was exceeded", errOut)
+	}
+}
+
+func TestRun_MaxQueryFlagRejectsOverCeiling(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--max-query", "70000", `exists(x)`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}
+
+func TestRun_LevelsFlagOverridesOrdinal(t *testing.T) {
+	// Without the override, "critical" is an unrecognized level token, so
+	// `level >= "warn"` falls back to byte-wise string comparison
+	// ("critical" < "warn" alphabetically -> false). With
+	// --levels critical=55, it resolves ordinally (55 >= 40 -> true).
+	stdin := `{"level":"critical"}` + "\n"
+	codeBefore, outBefore, errBefore := runCLI(t, []string{`level >= "warn"`}, stdin)
+	if codeBefore != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", codeBefore, errBefore)
+	}
+	if outBefore != "" {
+		t.Fatalf("out = %q, want no match without the --levels override", outBefore)
+	}
+
+	codeAfter, outAfter, errAfter := runCLI(t, []string{"--levels", "critical=55", `level >= "warn"`}, stdin)
+	if codeAfter != exitOK {
+		t.Fatalf("exit = %d (stderr: %s)", codeAfter, errAfter)
+	}
+	if outAfter == "" {
+		t.Fatal("out = \"\", want a match once --levels critical=55 makes the ordinal comparison resolve")
+	}
+}
+
+func TestRun_LevelsFlagMalformedEntryRejected(t *testing.T) {
+	code, _, errOut := runCLI(t, []string{"--levels", "notanumber", `exists(x)`}, "")
+	if code != exitUsage {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitUsage, errOut)
+	}
+}

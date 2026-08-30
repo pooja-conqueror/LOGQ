@@ -1,6 +1,7 @@
 package eval
 
 import (
+	"maps"
 	"math"
 	"strconv"
 	"strings"
@@ -20,11 +21,28 @@ var defaultLevelTable = map[string]int{
 	"fatal":   60,
 }
 
+// MergeLevelTable returns a fresh copy of the built-in defaultLevelTable
+// with overrides layered on top — §6.2: "--levels name=num,... extends/
+// overrides the table at startup." Entries not mentioned by overrides keep
+// their default ordinal; a name overrides matches also uses REPLACES the
+// default (never adds a second, shadowed entry). Override keys are
+// lowercased before insertion, matching LevelOrdinalFromTable's own
+// case-insensitive lookup convention — the default table's own keys are
+// already all lowercase for the same reason.
+func MergeLevelTable(overrides map[string]int) map[string]int {
+	merged := make(map[string]int, len(defaultLevelTable)+len(overrides))
+	maps.Copy(merged, defaultLevelTable)
+	for k, v := range overrides {
+		merged[strings.ToLower(k)] = v
+	}
+	return merged
+}
+
 // levelFieldNames are the field names that trigger level-ordinal coercion
 // when they appear on the left of a comparison (§6.2). Matching is exact
 // and case-sensitive — these are literal JSON/logfmt keys, not a
-// case-folded convention. --levels (CLI, Phase 8) extends the ordinal
-// *table*, not this name list, per spec.
+// case-folded convention. --levels extends the ordinal *table* (see
+// MergeLevelTable), not this name list, per spec.
 var levelFieldNames = map[string]bool{
 	"level":    true,
 	"severity": true,

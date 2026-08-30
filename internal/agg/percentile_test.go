@@ -6,8 +6,58 @@ import (
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 )
 
+func TestNewPercentileWithSeed_SameSeedIsDeterministic(t *testing.T) {
+	build := func() eval.Value {
+		p := NewPercentileWithSeed(0.95, 25, 42)
+		for i := range int64(300) {
+			p.Add(eval.Int(i))
+		}
+		v, _, _ := p.Result()
+		return v
+	}
+	a, b := build(), build()
+	if a.I != b.I {
+		t.Fatalf("two runs with the same explicit seed diverged: %d vs %d", a.I, b.I)
+	}
+}
+
+func TestNewPercentileWithSeed_DifferentSeedsCanDivergeButEachStaysExact(t *testing.T) {
+	// Not asserting the two samples differ (a collision is possible, just
+	// astronomically unlikely to construct deliberately) — asserting the
+	// seed parameter actually reaches the underlying Reservoir at all, by
+	// checking each independently satisfies the exact/approx contract.
+	p1 := NewPercentileWithSeed(0.5, 10, 1)
+	p2 := NewPercentileWithSeed(0.5, 10, 2)
+	for i := range int64(100) {
+		p1.Add(eval.Int(i))
+		p2.Add(eval.Int(i))
+	}
+	_, approx1, ok1 := p1.Result()
+	_, approx2, ok2 := p2.Result()
+	if !ok1 || !ok2 {
+		t.Fatal("both percentiles should report ok=true")
+	}
+	if !approx1 || !approx2 {
+		t.Fatal("both percentiles should report approx=true (100 values fed into a cap-10 reservoir)")
+	}
+}
+
+func TestNewPercentileWithCap_UsesDefaultSeed(t *testing.T) {
+	a := NewPercentileWithCap(0.5, 20)
+	b := NewPercentileWithSeed(0.5, 20, DefaultReservoirSeed)
+	for i := range int64(200) {
+		a.Add(eval.Int(i))
+		b.Add(eval.Int(i))
+	}
+	va, _, _ := a.Result()
+	vb, _, _ := b.Result()
+	if va.I != vb.I {
+		t.Fatalf("NewPercentileWithCap = %d, want it to match NewPercentileWithSeed(..., DefaultReservoirSeed) = %d", va.I, vb.I)
+	}
+}
+
 func TestReservoir_UnderCapKeepsEverythingInOrder(t *testing.T) {
-	r := NewReservoir(10, defaultReservoirSeed)
+	r := NewReservoir(10, DefaultReservoirSeed)
 	for i := range int64(5) {
 		r.Add(eval.Int(i))
 	}
@@ -26,7 +76,7 @@ func TestReservoir_UnderCapKeepsEverythingInOrder(t *testing.T) {
 }
 
 func TestReservoir_OverCapStaysAtCapSize(t *testing.T) {
-	r := NewReservoir(50, defaultReservoirSeed)
+	r := NewReservoir(50, DefaultReservoirSeed)
 	for i := range int64(1000) {
 		r.Add(eval.Int(i))
 	}
@@ -42,7 +92,7 @@ func TestReservoir_OverCapValuesAreDistinctSubsetOfInput(t *testing.T) {
 	// Each input value (0..999) is unique; Algorithm L never duplicates one
 	// input item into two reservoir slots, so every sampled value must be
 	// in range and pairwise distinct.
-	r := NewReservoir(50, defaultReservoirSeed)
+	r := NewReservoir(50, DefaultReservoirSeed)
 	for i := range int64(1000) {
 		r.Add(eval.Int(i))
 	}
@@ -60,7 +110,7 @@ func TestReservoir_OverCapValuesAreDistinctSubsetOfInput(t *testing.T) {
 
 func TestReservoir_DeterministicAcrossInstances(t *testing.T) {
 	build := func() []eval.Value {
-		r := NewReservoir(20, defaultReservoirSeed)
+		r := NewReservoir(20, DefaultReservoirSeed)
 		for i := range int64(500) {
 			r.Add(eval.Int(i))
 		}

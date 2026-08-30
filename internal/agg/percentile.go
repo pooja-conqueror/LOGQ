@@ -8,19 +8,19 @@ import (
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 )
 
-// defaultReservoirSeed is the fixed seed Reservoir uses unless told
-// otherwise (wired to a --seed flag in a later commit). Batch-mode
-// determinism (§15) requires percentile output to be a pure function of
-// (input, query, flags) — the seed must never come from process or
-// wall-clock entropy.
-const defaultReservoirSeed = 0
+// DefaultReservoirSeed is the fixed seed Reservoir uses unless a --seed
+// flag overrides it (internal/pipeline/stats.go, wired to cmd/logq).
+// Batch-mode determinism (§15) requires percentile output to be a pure
+// function of (input, query, flags) — the seed must never come from
+// process or wall-clock entropy, whatever value it's set to.
+const DefaultReservoirSeed = 0
 
-// defaultMaxSample is the reservoir cap p50/p95/p99 use unless told
-// otherwise (wired to a --max-sample flag in a later commit) — chosen
-// large enough that real-world grouped percentile queries stay exact in
-// practice, while still bounding memory to O(cap) regardless of how many
-// records actually flow through a group.
-const defaultMaxSample = 100000
+// DefaultMaxSample is the reservoir cap p50/p95/p99 use unless a
+// --max-sample flag overrides it — chosen large enough that real-world
+// grouped percentile queries stay exact in practice, while still bounding
+// memory to O(cap) regardless of how many records actually flow through a
+// group.
+const DefaultMaxSample = 100000
 
 // Reservoir implements Vitter's Algorithm L (J.S. Vitter, "Random
 // Sampling with a Reservoir," ACM TOMS 11(1), 1985) — deliberately NOT
@@ -119,14 +119,22 @@ type Percentile struct {
 // NewPercentile creates a percentile aggregator at quantile q (e.g. 0.95
 // for p95), using the default reservoir cap.
 func NewPercentile(q float64) *Percentile {
-	return NewPercentileWithCap(q, defaultMaxSample)
+	return NewPercentileWithCap(q, DefaultMaxSample)
 }
 
 // NewPercentileWithCap is NewPercentile with an explicit reservoir cap —
 // exported mainly so tests can exercise the approximate path without
-// pushing defaultMaxSample+1 values through in every case.
+// pushing DefaultMaxSample+1 values through in every case.
 func NewPercentileWithCap(q float64, k int) *Percentile {
-	return &Percentile{q: q, reservoir: NewReservoir(k, defaultReservoirSeed)}
+	return NewPercentileWithSeed(q, k, DefaultReservoirSeed)
+}
+
+// NewPercentileWithSeed is NewPercentileWithCap with an explicit reservoir
+// seed too — the full constructor everything else delegates to, exported
+// for a --seed flag override (§8.4: "fixed default seed 0 (--seed
+// exposed)").
+func NewPercentileWithSeed(q float64, k int, seed int64) *Percentile {
+	return &Percentile{q: q, reservoir: NewReservoir(k, seed)}
 }
 
 // Add feeds v in if it's numeric (Int or Float). Anything else —

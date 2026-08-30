@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pooja-conqueror/LOGQ/internal/lex"
 )
@@ -20,6 +21,29 @@ var (
 // input gets a positioned E-PARSE instead of relying on the runtime's
 // (very large, but not infinite) goroutine stack.
 const maxParenDepth = 100
+
+// posAtRune computes the {line,col} position of the rune at index n
+// within src (1-based, rune-count columns — matching lex.Pos's own
+// convention), for reporting a positioned error before any real lexing
+// has happened (ParseQueryWithLimit's length check runs first). Offset is
+// left 0: no byte-offset context exists yet at this point, and
+// ParseError's own Error() method never reads it anyway.
+func posAtRune(src string, n int) lex.Pos {
+	line, col, idx := 1, 1, 0
+	for _, r := range src {
+		if idx == n {
+			break
+		}
+		if r == '\n' {
+			line++
+			col = 1
+		} else {
+			col++
+		}
+		idx++
+	}
+	return lex.Pos{Line: line, Col: col}
+}
 
 // topLevelConnectors and existsCandidates are the current, honest set of
 // keywords a "did you mean" suggestion can be offered against. They grow as
@@ -82,11 +106,33 @@ func (p *parser) errWithSuggest(pos lex.Pos, got string, candidates []string, fo
 	}
 }
 
+// DefaultMaxQueryLen is the query text length limit (in runes, matching
+// the lexer's own rune-count column convention) ParseQuery enforces
+// unless told otherwise — §"Limits": "query length <= 8192 chars
+// (--max-query up to 65536) ... each breach -> positioned E-PARSE."
+const DefaultMaxQueryLen = 8192
+
 // ParseQuery parses a full query: an optional FilterExpr followed by zero
 // or more "|"-separated pipeline stages — fields, sort, limit, and stats
-// are all real grammar as of this commit (stats' actual aggregation
-// engine lands later in Phase 8; it parses correctly here regardless).
+// are all real grammar. It's ParseQueryWithLimit using DefaultMaxQueryLen.
 func ParseQuery(src string) (*Query, error) {
+	return ParseQueryWithLimit(src, DefaultMaxQueryLen)
+}
+
+// ParseQueryWithLimit is ParseQuery with an explicit length limit —
+// exported so a --max-query flag (range enforced by the CLI layer, up to
+// 65536 per spec) can override the default without duplicating the rest
+// of ParseQuery's logic. The check runs before any lexing at all, so an
+// over-length query is always a fast, positioned rejection, never a
+// resource cost proportional to its own excessive size.
+func ParseQueryWithLimit(src string, maxLen int) (*Query, error) {
+	if n := utf8.RuneCountInString(src); n > maxLen {
+		return nil, &ParseError{
+			Pos: posAtRune(src, maxLen),
+			Msg: fmt.Sprintf("query text exceeds the %d-character limit (got %d)", maxLen, n),
+		}
+	}
+
 	p := newParser(src)
 	q := &Query{}
 

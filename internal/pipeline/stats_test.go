@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pooja-conqueror/LOGQ/internal/agg"
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 	"github.com/pooja-conqueror/LOGQ/internal/query"
 )
@@ -306,7 +307,7 @@ func TestStats_WindowingNoTsSortsFirst(t *testing.T) {
 
 func TestStats_MaxGroupsOverflowsToOther(t *testing.T) {
 	ss := mustStatsStage(t, `| stats count() by service`)
-	s, err := NewStatsWithLimits(ss, time.UTC, 2, 0)
+	s, err := NewStatsWithLimits(ss, time.UTC, 2, 0, agg.DefaultReservoirSeed)
 	if err != nil {
 		t.Fatalf("NewStatsWithLimits error = %v", err)
 	}
@@ -334,7 +335,7 @@ func TestStats_MaxGroupsOverflowsToOther(t *testing.T) {
 
 func TestStats_CountDistinctInOtherReportsEmptySetMarker(t *testing.T) {
 	ss := mustStatsStage(t, `| stats count_distinct(user) by service`)
-	s, err := NewStatsWithLimits(ss, time.UTC, 1, 0)
+	s, err := NewStatsWithLimits(ss, time.UTC, 1, 0, agg.DefaultReservoirSeed)
 	if err != nil {
 		t.Fatalf("NewStatsWithLimits error = %v", err)
 	}
@@ -353,7 +354,7 @@ func TestStats_CountDistinctInOtherReportsEmptySetMarker(t *testing.T) {
 
 func TestStats_PercentileApproxGetsStarMarker(t *testing.T) {
 	ss := mustStatsStage(t, `| stats p50(x)`)
-	s, err := NewStatsWithLimits(ss, time.UTC, DefaultMaxGroups, 5) // tiny reservoir cap
+	s, err := NewStatsWithLimits(ss, time.UTC, DefaultMaxGroups, 5, agg.DefaultReservoirSeed) // tiny reservoir cap
 	if err != nil {
 		t.Fatalf("NewStatsWithLimits error = %v", err)
 	}

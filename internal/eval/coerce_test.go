@@ -191,3 +191,41 @@ func TestCoerceTimestampDuration_NotApplicable(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeLevelTable_UnmentionedNamesKeepDefault(t *testing.T) {
+	merged := MergeLevelTable(map[string]int{"critical": 55})
+	if merged["info"] != defaultLevelTable["info"] {
+		t.Fatalf("merged[\"info\"] = %d, want the untouched default %d", merged["info"], defaultLevelTable["info"])
+	}
+	if merged["critical"] != 55 {
+		t.Fatalf("merged[\"critical\"] = %d, want 55", merged["critical"])
+	}
+}
+
+func TestMergeLevelTable_OverrideReplacesDefault(t *testing.T) {
+	merged := MergeLevelTable(map[string]int{"warn": 999})
+	if merged["warn"] != 999 {
+		t.Fatalf("merged[\"warn\"] = %d, want the override 999, not the default %d", merged["warn"], defaultLevelTable["warn"])
+	}
+}
+
+func TestMergeLevelTable_OverrideKeysAreLowercased(t *testing.T) {
+	merged := MergeLevelTable(map[string]int{"CRITICAL": 55})
+	if merged["critical"] != 55 {
+		t.Fatalf("merged[\"critical\"] = %d, want 55 — override keys must lowercase, matching LevelOrdinalFromTable's own lookup", merged["critical"])
+	}
+}
+
+func TestMergeLevelTable_NilOverridesStillReturnsDefault(t *testing.T) {
+	merged := MergeLevelTable(nil)
+	if merged["error"] != defaultLevelTable["error"] {
+		t.Fatalf("merged[\"error\"] = %d, want the default %d", merged["error"], defaultLevelTable["error"])
+	}
+}
+
+func TestMergeLevelTable_DoesNotMutateTheDefaultTable(t *testing.T) {
+	_ = MergeLevelTable(map[string]int{"warn": 999})
+	if defaultLevelTable["warn"] != 40 {
+		t.Fatalf("defaultLevelTable[\"warn\"] = %d, want the original 40 — MergeLevelTable must return a copy, never mutate the shared default", defaultLevelTable["warn"])
+	}
+}

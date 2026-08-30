@@ -706,3 +706,47 @@ func TestParseQuery_StatsStage_UnknownFunctionName(t *testing.T) {
 		t.Fatal("an unrecognized stat function name should fail to parse")
 	}
 }
+
+func TestParseQueryWithLimit_RejectsOverLength(t *testing.T) {
+	long := "exists(" + strings.Repeat("a", 30) + ")"
+	_, err := ParseQueryWithLimit(long, 10)
+	if err == nil {
+		t.Fatal("query longer than the limit should be rejected")
+	}
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("err = %T, want *ParseError", err)
+	}
+	if pe.Pos.Line != 1 || pe.Pos.Col != 11 {
+		t.Fatalf("Pos = %+v, want line 1, col 11 (the rune right after the 10-char limit)", pe.Pos)
+	}
+}
+
+func TestParseQueryWithLimit_AtExactLimitIsAccepted(t *testing.T) {
+	q := `exists(a)` // exactly 9 characters
+	if _, err := ParseQueryWithLimit(q, 9); err != nil {
+		t.Fatalf("a query exactly at the limit should be accepted, got error: %v", err)
+	}
+}
+
+func TestParseQueryWithLimit_PositionAccountsForNewlines(t *testing.T) {
+	// A query containing a literal newline before the cutoff must report
+	// line 2, not line 1 — proves posAtRune actually tracks lines, not
+	// just a flat column count.
+	q := "exists(a)\n" + strings.Repeat("b", 20)
+	_, err := ParseQueryWithLimit(q, 12)
+	pe, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("err = %T (%v), want *ParseError", err, err)
+	}
+	if pe.Pos.Line != 2 {
+		t.Fatalf("Pos.Line = %d, want 2", pe.Pos.Line)
+	}
+}
+
+func TestParseQuery_DefaultLimitRejectsOverLength(t *testing.T) {
+	long := "exists(" + strings.Repeat("a", DefaultMaxQueryLen) + ")"
+	if _, err := ParseQuery(long); err == nil {
+		t.Fatal("a query well beyond DefaultMaxQueryLen should be rejected by plain ParseQuery too")
+	}
+}

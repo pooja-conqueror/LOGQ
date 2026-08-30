@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 	_ "time/tzdata" // embed the IANA timezone database in the binary — see --tz below
 
+	"github.com/pooja-conqueror/LOGQ/internal/agg"
 	"github.com/pooja-conqueror/LOGQ/internal/eval"
 	"github.com/pooja-conqueror/LOGQ/internal/formats"
 	"github.com/pooja-conqueror/LOGQ/internal/logfmtx"
@@ -29,6 +32,15 @@ const (
 	exitDataStrict  = 3
 	exitIO          = 4
 	exitInterrupted = 130
+)
+
+// Ceilings a --max-line/--max-query flag value must not exceed — the
+// spec's own stated caps ("--max-line up to 16MB", "--max-query up to
+// 65536"), not just a bare default a user could otherwise raise without
+// limit.
+const (
+	maxLineCeiling  = 16 << 20 // 16MB
+	maxQueryCeiling = 65536
 )
 
 const usageText = `logq - query gigabytes of logs with a one-line expression
@@ -58,6 +70,27 @@ Flags:
       --until BOUND      drop records newer than BOUND; RFC3339, "now", or
                          a duration. Same drop-if-no-timestamp rule as
                          --since.
+      --max-groups N     stats cardinality guard: at most N distinct
+                         groups tracked before newer keys collapse into a
+                         single (other) row (default 10000).
+      --max-sample N     percentile (p50/p95/p99) reservoir cap per group;
+                         exact under this many values, approximate (with
+                         a "*"-marked cell) beyond it (default 100000).
+      --seed N           percentile reservoir PRNG seed — fixed by
+                         default so approximate percentiles stay
+                         reproducible across runs (default 0).
+      --levels LIST      extend/override level-ordinal names, comma-
+                         separated name=NUMBER pairs (e.g.
+                         "critical=55"); unmentioned names keep their
+                         built-in ordinal.
+      --max-depth N      max JSON object/array nesting depth before a
+                         line is rejected as malformed (default 32).
+      --max-line N       max input line length in bytes; a longer line
+                         is skipped whole and counted, never truncated
+                         silently (default 1MB, up to 16MB).
+      --max-query N      max query text length in characters, checked
+                         before any parsing begins (default 8192, up to
+                         65536).
   -h, --help             show this help and exit
       --version          show version and exit
 
@@ -83,6 +116,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	tz := fs.String("tz", "UTC", "IANA zone for naive timestamps and --since/--until \"now\"")
 	since := fs.String("since", "", "drop records older than this (RFC3339 or a duration like -1h)")
 	until := fs.String("until", "", "drop records newer than this (RFC3339, \"now\", or a duration)")
+	maxGroups := fs.Int("max-groups", pipeline.DefaultMaxGroups, "stats cardinality guard")
+	maxSample := fs.Int("max-sample", agg.DefaultMaxSample, "percentile reservoir cap per group")
+	seed := fs.Int64("seed", agg.DefaultReservoirSeed, "percentile reservoir PRNG seed")
+	levels := fs.String("levels", "", "extend/override level ordinals: name=NUM,...")
+	maxDepth := fs.Int("max-depth", formats.DefaultMaxDepth, "max JSON nesting depth")
+	maxLine := fs.Int("max-line", formats.DefaultMaxLine, "max input line length in bytes")
+	maxQuery := fs.Int("max-query", query.DefaultMaxQueryLen, "max query text length in characters")
 	help := fs.Bool("h", false, "show help")
 	fs.BoolVar(help, "help", false, "show help")
 	showVersion := fs.Bool("version", false, "show version")
@@ -121,6 +161,32 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
+	if *maxGroups < 1 {
+		fmt.Fprintf(stderr, "logq: --max-groups must be >= 1, got %d\n", *maxGroups)
+		return exitUsage
+	}
+	if *maxSample < 1 {
+		fmt.Fprintf(stderr, "logq: --max-sample must be >= 1, got %d\n", *maxSample)
+		return exitUsage
+	}
+	if *maxDepth < 1 {
+		fmt.Fprintf(stderr, "logq: --max-depth must be >= 1, got %d\n", *maxDepth)
+		return exitUsage
+	}
+	if *maxLine < 1 || *maxLine > maxLineCeiling {
+		fmt.Fprintf(stderr, "logq: --max-line must be between 1 and %d (16MB), got %d\n", maxLineCeiling, *maxLine)
+		return exitUsage
+	}
+	if *maxQuery < 1 || *maxQuery > maxQueryCeiling {
+		fmt.Fprintf(stderr, "logq: --max-query must be between 1 and %d, got %d\n", maxQueryCeiling, *maxQuery)
+		return exitUsage
+	}
+	levelOverrides, err := parseLevelsFlag(*levels)
+	if err != nil {
+		fmt.Fprintf(stderr, "logq: %v\n", err)
+		return exitUsage
+	}
+
 	loc, err := time.LoadLocation(*tz)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: invalid --tz %q: %v\n", *tz, err)
@@ -155,17 +221,21 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// Query compilation happens entirely before any I/O — a bad query
 	// never even opens a file (§12.3: "Query compile fail: exit 2 before
 	// any I/O").
-	q, err := query.ParseQuery(queryText)
+	q, err := query.ParseQueryWithLimit(queryText, *maxQuery)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
-	cf, err := eval.Compile(q.Filter)
+	var levelTable map[string]int
+	if levelOverrides != nil {
+		levelTable = eval.MergeLevelTable(levelOverrides)
+	}
+	cf, err := eval.CompileWithLevelTable(q.Filter, levelTable)
 	if err != nil {
 		fmt.Fprintf(stderr, "logq: %v\n", err)
 		return exitCompile
 	}
-	pl, err := buildPipeline(q.Stages, loc)
+	pl, err := buildPipeline(q.Stages, loc, *maxGroups, *maxSample, *seed)
 	if err != nil {
 		// e.g. NewFields' S-8 duplicate-output-column check — still a
 		// compile-time failure, before any I/O.
@@ -202,7 +272,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// just the rest of the current one.
 	var totalLines, malformed, droppedByWindow int
 	for _, src := range sources {
-		n, m, d, done, srcErr := processSource(out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound)
+		n, m, d, done, srcErr := processSource(out, buffered, cf, pl, stagesPresent, now, src, *format, *output, loc, sinceBound, untilBound, *maxDepth, *maxLine)
 		totalLines += n
 		malformed += m
 		droppedByWindow += d
@@ -281,8 +351,10 @@ type bufferedRenderer interface {
 // build (NewFields' S-8 duplicate-column check) is a compile-time error,
 // exactly like an invalid query itself. loc is the run's resolved --tz
 // location, needed by StatsStage's window-bucket alignment (§8.1) even
-// when no "every" clause is present, for API uniformity.
-func buildPipeline(stages []query.Stage, loc *time.Location) (*pipeline.Pipeline, error) {
+// when no "every" clause is present, for API uniformity. maxGroups/
+// maxSample/seed are --max-groups/--max-sample/--seed's values, passed
+// straight through to pipeline.NewStatsWithLimits.
+func buildPipeline(stages []query.Stage, loc *time.Location, maxGroups, maxSample int, seed int64) (*pipeline.Pipeline, error) {
 	execStages := make([]pipeline.Stage, 0, len(stages))
 	for _, st := range stages {
 		switch s := st.(type) {
@@ -297,7 +369,7 @@ func buildPipeline(stages []query.Stage, loc *time.Location) (*pipeline.Pipeline
 		case *query.LimitStage:
 			execStages = append(execStages, pipeline.NewLimit(s.Limit))
 		case *query.StatsStage:
-			ss, err := pipeline.NewStats(s, loc)
+			ss, err := pipeline.NewStatsWithLimits(s, loc, maxGroups, maxSample, seed)
 			if err != nil {
 				return nil, err
 			}
@@ -307,6 +379,29 @@ func buildPipeline(stages []query.Stage, loc *time.Location) (*pipeline.Pipeline
 		}
 	}
 	return pipeline.New(execStages...), nil
+}
+
+// parseLevelsFlag parses --levels' "name=NUM,name2=NUM2" syntax into an
+// override map ready for eval.MergeLevelTable. An empty string means no
+// overrides at all — nil, not an empty map, so the common "no --levels
+// given" case costs nothing beyond a nil check downstream.
+func parseLevelsFlag(s string) (map[string]int, error) {
+	if s == "" {
+		return nil, nil
+	}
+	out := make(map[string]int)
+	for _, pair := range strings.Split(s, ",") {
+		name, numText, ok := strings.Cut(pair, "=")
+		if !ok || name == "" || numText == "" {
+			return nil, fmt.Errorf("invalid --levels entry %q, want name=NUMBER", pair)
+		}
+		n, err := strconv.Atoi(numText)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --levels entry %q: ordinal must be an integer", pair)
+		}
+		out[name] = n
+	}
+	return out, nil
 }
 
 // renderRecord writes rec per the requested output mode.
@@ -343,13 +438,14 @@ func renderRecord(out io.Writer, buffered bufferedRenderer, rec *eval.Record, li
 // It returns per-source counts — detection and its "auto" sampling are
 // per-source (§9.2: "Detection cached per file"), never shared across
 // multiple files in one run. A non-nil err is a fatal read/write failure;
-// the caller stops the whole run on it (exit 4).
-func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time) (linesRead, malformed, droppedByWindow int, done bool, err error) {
+// the caller stops the whole run on it (exit 4). maxDepth/maxLine are
+// --max-depth/--max-line's values.
+func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, src io.Reader, forcedFormat, output string, loc *time.Location, since, until *time.Time, maxDepth, maxLine int) (linesRead, malformed, droppedByWindow int, done bool, err error) {
 	gzr, err := formats.MaybeGunzip(src)
 	if err != nil {
 		return 0, 0, 0, false, err
 	}
-	lr := formats.NewLineReader(gzr, 0)
+	lr := formats.NewLineReader(gzr, maxLine)
 
 	var srcFormat formats.Format
 	var sample [][]byte
@@ -374,7 +470,7 @@ func processSource(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFi
 	// further ones too.
 	process := func(line []byte) (stop bool, err error) {
 		linesRead++
-		outcome, pipelineDone, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, srcFormat, loc, since, until, output)
+		outcome, pipelineDone, werr := processLine(out, buffered, cf, pl, stagesPresent, now, line, srcFormat, loc, since, until, output, maxDepth)
 		if werr != nil {
 			return false, werr
 		}
@@ -439,8 +535,8 @@ const (
 // out, which the caller treats as fatal. done propagates the pipeline's
 // own done signal (§ Stage: "no more input needs to be read at all") —
 // true once, for instance, limit's count has been reached.
-func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string) (outcome lineOutcome, done bool, err error) {
-	rec, decErr := decodeLine(line, format)
+func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilter, pl *pipeline.Pipeline, stagesPresent bool, now time.Time, line []byte, format formats.Format, loc *time.Location, since, until *time.Time, output string, maxDepth int) (outcome lineOutcome, done bool, err error) {
+	rec, decErr := decodeLine(line, format, maxDepth)
 	if decErr != nil {
 		return outcomeMalformed, false, nil
 	}
@@ -479,15 +575,16 @@ func processLine(out io.Writer, buffered bufferedRenderer, cf *eval.CompiledFilt
 }
 
 // decodeLine dispatches to the right per-format decoder. FormatPlain can
-// never fail — there's nothing to parse, only to wrap.
-func decodeLine(line []byte, format formats.Format) (*eval.Record, error) {
+// never fail — there's nothing to parse, only to wrap. maxDepth is
+// --max-depth's value, consulted only for jsonl.
+func decodeLine(line []byte, format formats.Format, maxDepth int) (*eval.Record, error) {
 	switch format {
 	case formats.FormatLogfmt:
 		return logfmtx.DecodeLine(line)
 	case formats.FormatPlain:
 		return formats.DecodePlainLine(line), nil
 	default: // formats.FormatJSONL
-		res, err := formats.DecodeLine(line, formats.DefaultMaxDepth)
+		res, err := formats.DecodeLine(line, maxDepth)
 		if err != nil {
 			return nil, err
 		}
