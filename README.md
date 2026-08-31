@@ -4,7 +4,6 @@
 
 [![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?style=flat&logo=go&logoColor=white)](go.mod)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-2ea44f?style=flat)](STDLIB.md)
-[![CI](https://img.shields.io/github/actions/workflow/status/pooja-conqueror/LOGQ/ci.yml?branch=main&label=CI)](https://github.com/pooja-conqueror/LOGQ/actions/workflows/ci.yml)
 [![Tests](https://img.shields.io/badge/tests-746%20passing-2ea44f?style=flat)](#testing--ci)
 [![Reproducible Build](https://img.shields.io/badge/reproducible%20build-verified-2ea44f?style=flat)](#zero-dependency-hackathon-2026)
 [![Track B](https://img.shields.io/badge/track-B%20Parsers%20%26%20Data%20Formats-orange?style=flat)](.zero-dep.toml)
@@ -87,7 +86,7 @@ copy-pasteable, and true.
 - [Repository Layout](#repository-layout)
 - [Usage](#usage)
 - [Query Language](#query-language)
-- [Testing & CI](#testing--ci)
+- [Testing](#testing)
 - [Honest Limits](#honest-limits)
 - [License](#license)
 
@@ -348,7 +347,7 @@ Every comparison involving `MISSING` evaluates to `false` — never an error —
 so a query never aborts partway through a file just because one record has
 a different shape than the rest.
 
-## Testing & CI
+## Testing
 
 ```sh
 go test ./...  # everything: 746 tests, 14 packages
@@ -380,36 +379,24 @@ throughput numbers — wins and losses both — are in
 [`BENCHMARKS.md`](BENCHMARKS.md).
 
 <details>
-<summary><strong>make cover · make repro-check · make verify-differential · CI details</strong> (click to expand)</summary>
+<summary><strong>make cover · make repro-check · make verify-differential</strong> (click to expand)</summary>
 
 `make cover` runs `go test -coverprofile` scoped to `./internal/...` and
 gates on ≥85% line coverage — **89.6% measured** on this machine on
-2026-08-30, the same command CI's `coverage` job runs. `make repro-check`
-is the declared Reproducible Build bonus: build twice with identical flags,
-`sha256sum` both, fail if they differ (verified locally). `make
-verify-differential` is an opt-in QA harness
+2026-08-30. `make repro-check` is the declared Reproducible Build bonus:
+build twice with identical flags, `sha256sum` both, fail if they differ
+(verified locally). `make verify-differential` is an opt-in QA harness
 ([`scripts/verify-differential.sh`](scripts/verify-differential.sh))
 cross-checking a handful of filter queries (`exists()`/`==`/`>=`) against
 `jq` as an independent oracle; disclosed in `STDLIB.md`'s Disclosures
-section as dev-only tooling, and deliberately never wired into
-`make test`, `make build`, or CI — it skips itself cleanly if `jq` isn't
-installed.
+section as dev-only tooling, and deliberately never wired into `make test`
+or `make build` — it skips itself cleanly if `jq` isn't installed.
 
 This dev environment has neither a C compiler nor `make` itself installed —
 every Makefile target above was verified by running its underlying
 `go`/shell commands directly and confirming the same result, not via an
-actual `make` invocation; CI's Linux runners have both.
-
-**CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): build+test
-run on a linux/macos/windows matrix; `coverage`, `race`, `fuzz-smoke`,
-`proof` (deps-proof.txt regenerated fresh and asserted empty), and
-`repro-check` each run as their own job, `race` and the rest on
-`ubuntu-latest` specifically since that's the one runner guaranteed to have
-a C compiler — this project's own dev environment doesn't, so `-race`
-itself could only be validated by inspection and by running its
-non-instrumented counterpart locally, not by an actual passing `-race` run
-in this session; the workflow is wired to run it in CI, but no CI run has
-executed yet to confirm that pass as of this commit.
+actual `make` invocation. No CI is configured for this repo — every claim
+in this README is a locally-run, directly-verified result, not a badge.
 
 </details>
 
@@ -480,9 +467,9 @@ executed yet to confirm that pass as of this commit.
   high-cardinality/-j cases) exist and the sharded design is reasoned to
   be race-free (each shard's state is touched only by its own owning
   goroutine, all cross-goroutine communication is via channels), but a
-  passing `-race` run itself has only been *configured* (CI's `race` job,
-  `ubuntu-latest`, which does have a C compiler), not yet actually
-  observed — no CI run has executed as of this commit. `BENCHMARKS.md`
+  passing `-race` run itself has not actually been observed anywhere —
+  disclosed as a real, open gap, not silently assumed clean.
+  `BENCHMARKS.md`
   also has a real, measured surprise here: `-j N` is not a throughput win
   at the scales tested (only stats' own aggregation is sharded; JSON
   decode, the actual bottleneck, stays single-threaded regardless of `-j`)

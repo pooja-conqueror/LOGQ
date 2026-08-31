@@ -30,11 +30,11 @@ race:
 bench:
 	go test -bench=. -benchmem -run=^$$ ./cmd/logq/...
 
-# internal/* line-coverage gate — CI's coverage job runs exactly this,
-# and fails the same way it does: coverage.out is scoped to ./internal/...
-# only (cmd/logq's flag-wiring/main-loop glue is exercised end-to-end by
-# tests/golden and tests/chaos instead, not counted toward this number)
-# — 89.6% measured on 2026-08-30, comfortably over the 85% gate.
+# internal/* line-coverage gate — coverage.out is scoped to
+# ./internal/... only (cmd/logq's flag-wiring/main-loop glue is exercised
+# end-to-end by tests/golden and tests/chaos instead, not counted toward
+# this number) — 89.6% measured on 2026-08-30, comfortably over the 85%
+# gate.
 cover:
 	go test -coverprofile=coverage.out ./internal/...
 	go tool cover -func=coverage.out | tail -1
@@ -61,19 +61,19 @@ repro-check:
 # Opt-in differential QA harness comparing logq's filter semantics
 # against jq as an independent oracle, on a handful of exists/==/>=
 # cases (scripts/verify-differential.sh). Deliberately NOT wired into
-# `test`, `build`, or ci.yml — jq is an external CLI tool, not a Go
-# dependency, but using it as a correctness oracle is still dev-only
-# tooling outside the required, always-runnable test suite (disclosed
-# in STDLIB.md's Disclosures section, not silently left off the ledger).
-# Skips itself cleanly (exit 0) if jq isn't on PATH.
+# `test` or `build` — jq is an external CLI tool, not a Go dependency,
+# but using it as a correctness oracle is still dev-only tooling outside
+# the required, always-runnable test suite (disclosed in STDLIB.md's
+# Disclosures section, not silently left off the ledger). Skips itself
+# cleanly (exit 0) if jq isn't on PATH.
 verify-differential: build
 	./scripts/verify-differential.sh
 
 # Full-scale (default 2GB) manual soak run — the counterpart to the
 # small, automated corpus TestSoak_MemoryStaysBoundedAcrossCorpusScale
-# generates on every `go test ./...`. Deliberately not part of `test`,
-# `fuzz`, or CI: writing and reading 2GB is real wall-clock time no
-# inner dev loop should pay on every run. corpus.jsonl is gitignored.
+# generates on every `go test ./...`. Deliberately not part of `test` or
+# `fuzz`: writing and reading 2GB is real wall-clock time no inner dev
+# loop should pay on every run. corpus.jsonl is gitignored.
 soak-manual: build
 	go run scripts/gen-corpus.go -out corpus.jsonl -bytes 2147483648
 	time ./bin/logq 'level == "error"' corpus.jsonl -o table
